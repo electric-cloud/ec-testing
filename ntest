@@ -1,0 +1,2980 @@
+#!/usr/bin/env ec-perl
+# -*-Perl-*-
+
+# ntest -
+#
+# This file contains the basic infrastructure for ElectricCommander tests.
+# It is invoked from the command line to run tests (see "Command-Line
+# Options" below) and also defines various routines used by tests, such
+# as the "ntest" subroutine that defines a test, various "assert" subroutines
+# for error checking in tests, and other utilities such as those for
+# making HTTP requests.
+#
+# The following special keyword indicates that the "cleanup" script should
+# scan this file for formatting errors, even though it doesn't have one of
+# the expected extensions.
+# CLEANUP: CHECK
+#
+# Copyright (c) 2005-2009 Electric Cloud, Inc.
+# All rights reserved
+
+use strict;
+use warnings;
+use Carp;
+use Cwd;
+use File::Basename;
+use File::Path;
+use File::Spec;
+use FindBin;
+use Getopt::Long;
+use HTTP::Cookies;
+use LWP::ConnCache;
+use LWP::UserAgent;
+use Time::Duration;
+use Time::Local;
+use XML::XPath;
+use XML::Parser;
+use lib "$FindBin::Bin";
+use Assert;
+use Archive::Zip qw(:ERROR_CODES);
+
+# Remove COMMANDER_HTTP_PROXY from the environment. It will be set
+# if we're running in a step context in chronic3. When we're running
+# tests, we don't want to accidentally proxy through the Chronic agent.
+delete $ENV{COMMANDER_HTTP_PROXY};
+
+$::gFoundECModule = eval {require ElectricCommander};
+
+# Turn off output buffering:
+
+$| = 1;
+
+# Set PERL5LIB if not already set so that perl sub-processes get the same
+# include path as this invocation.
+
+if (!exists($::ENV{PERL5LIB})) {
+    $::ENV{PERL5LIB} = join(isWindows() ? ";" : ":",
+                            @INC);
+}
+
+# ------------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------------
+
+# Every response from ElectricCommander starts with the same header.
+
+$::RESPONSE_PROLOG=
+'<?xml version="1.0" encoding="UTF-8"?>
+
+<responses version="2.0">
+';
+
+# ------------------------------------------------------------------------
+# Globals
+# ------------------------------------------------------------------------
+
+$::gCommander = '';                  # Will be initialized as a reference to
+                                     # to the ElectricCommander.pm object.
+
+# The following variables hold information from command-line arguments:
+
+
+$::gAuxPort = 0;                     # Value of --auxPort option (see doc
+                                     # above)
+
+$::gDebugLevel = '';                 # One or more characters specifying
+                                     # optional kinds of information to log.
+
+$::gDocRoot = '';                    # Directory containing the PHP files for
+                                     # the Web server being tested.
+
+$::gHelp = 0;                        # 1 means --help was specified.
+
+$::gMatch = '';                      # If nonempty, contains a regexp
+                                     # pattern; only tests whose names
+                                     # match this are executed.
+
+$::gStart = '';                      # If nonempty, contains a regexp
+                                     # pattern; no tests will run until
+                                     # a test name matches this pattern.
+
+$::gUntil = '';                      # If nonempty, contains a regexp pattern;
+                                     # no tests will run after a test name
+                                     # matches this pattern.
+
+$::gUntilFailure = 0;                # True means repeat each test until it
+                                     # fails. Most useful to run a single test
+                                     # until it fails.
+
+$::gQuiet = 0;                       # True means don't print anything about
+                                     # tests that pass: only print for errors.
+
+$::gTarget = "localhost:443";        # Location of the target being tested:
+                                     # used as default server for httpGet
+                                     # and httpPost.
+
+$::gTestOut = '';                    # Directory in which tests can create
+                                     # temporary files.  Some tests will use
+                                     # test-specific subdirectories of this
+                                     # directory.
+
+$::gTimeDetails = 0;                 # True means print an extra line after
+                                     # each test giving the time of day (used
+                                     # for test timing analysis).
+
+%::gTestTimes = ();                  # Hash containing test times, for output
+                                     # at the end of the test run.
+
+$::gUrlRoot = "commander";           # Value of --urlroot command-line
+                                     # argument.
+
+$::gWinAgents = '';                  # comma-separated list of agents
+$::gSolAgents = '';                  # for each platform for systemtests
+$::gLinAgents = '';
+$::gHpuxAgents = '';
+$::gMacintelAgents = '';
+$::gGlibc22Agents = '';
+$::gMacppcAgents = '';
+$::gSol86Agents = '';
+
+$::gWorkspace = '';                  # ElectricCommander workspace root
+$::gDbName = '';                     # Name of db.
+
+$::gECTool = "$^X \"$FindBin::Bin/../ectool/ectool.pl\"";
+                                     # Location of the 'ectool' utility.
+
+$::gSslPort = 443;                   # The SSL port used if the server is
+                                     # configured to use https.
+
+$::gUseHTTPS = 1;                    # True means that httpPost will hit
+                                     # an https url instead of plain http.
+
+# The following variables are used by serverUp and serverDown:
+
+$::gServerPid = 0;                   # Handle for the most recent server
+                                     # started by serverUp.
+$::gServerLog = '';                  # DOM object containing log information
+                                     # returned the last time serverDown was
+                                     # invoked.
+$::gServerDump = '';                 # Raw log information returned the last
+                                     # time serverDown was invoked.
+
+# The following variables keep track of what has happened while running
+# tests:
+
+$::gTestFile = '';                   # The name of the current test file
+$::gTestName = '';                   # The name of the current test
+$::gErrorMessages = '';              # During the running of a test, messages
+                                     # about test failures collect here.
+                                     # Empty means the test has succeeded
+                                     # so far.
+$::gTotalTests = 0;                  # Total number of tests executed.
+$::gSkippedTests = 0;                # Total number of tests that were
+                                     # skipped because of constraints.
+$::gFailedTests = 0;                 # Number of tests that failed.
+@::gFailedTestCollector = ();        # Array containing the names of all
+                                     # failed tests.
+$::gStackTrace = '';                 # Stack trace from unhandled error
+                                     # encountered during test evaluation.
+
+# State variables for managing HTTP-based interactions with the Web server
+# and ElectricCommander server:
+
+$::gUserAgent = LWP::UserAgent->new(); # Used for HTTP transactions.
+$::gConnCache = LWP::ConnCache->new();
+$::gUserAgent->conn_cache($::gConnCache);
+
+if (defined($ENV{"COMMANDER_TIMEOUT"})) {
+    $::gUserAgent->timeout($ENV{"COMMANDER_TIMEOUT"});
+} else {
+    $::gUserAgent->timeout(180);
+}
+
+$::gHTTPResponse = '';               # Response from the last HTTP request
+                                     # we made; allows us to examine
+                                     # headers, etc.
+$::gHTTPCookies = HTTP::Cookies->new;# Holds cookies from one request to
+                                     # another, in order to maintain session
+                                     # state.  A test can clear this to force
+                                     # a new session.
+$::gUserAgent->cookie_jar($::gHTTPCookies);
+
+@::gHTTPHeaders = ();                # A test can modify this variable before
+                                     # calling pokeWebServer.  It should
+                                     # contain a list of alternating names
+                                     # and values for headers to be added
+                                     # to the HTTP request.  The variable
+                                     # is cleared after each request.
+$::gSaveFiles = 0;                   # This secret back-door switch tells
+                                     # pokeWebServer not to delete the
+                                     # request/response files used for
+                                     # communication with the server.
+$::gConfigSaved = 0;                 # 1 means savePhpConfig has been called,
+                                     # but not restorePhpConfig.
+$::gRestoreConfig = 0;               # 1 means that there is a saved version
+                                     # of config_ntest.php that we must restore.
+$::gConfigCode = '';                 # A test can put PHP code here before
+                                     # calling pokeWebServer.  If so, the code
+                                     # gets appended to the temporary
+                                     # config_ntest.php file that we install for
+                                     # the test.
+$::gRawPost = 0;                     # In the normal case, pokeWebServer
+                                     # automatically sets the content type to
+                                     # "urlencoded" for POST requests. If a
+                                     # test sets this variable to nonzero,
+                                     # that feature is disabled for the next
+                                     # call to pokeWebServer.
+$::gKeepDoctype = 0;                 # In the normal case, evalOnWebServer
+                                     # and pokeWebServer automatically
+                                     # DOCTYPE specifications from HTML.
+                                     # If a test sets this variable to
+                                     # nonzero, that feature is disabled
+                                     # for the next call to pokeWebServer
+                                     # or evalOnWebServer.
+
+# Miscellaneous global variables:
+
+$::gNTestDir = $FindBin::Bin;        # Path to directory containing this
+                                     # script; used to locate auxiliary files
+                                     # for testing.
+$::gWorkingDirectory = cwd();        # Original working directory for the
+                                     # program; used to restore cwd after
+                                     # each test.
+$::gCreatePrivateDirs = 1;           # True means we should create a private
+                                     # subdirectory of $::gTestOut for each
+                                     # test to use for working files.  False
+                                     # means run all tests in $::gTestOut
+                                     # (presumably the tests don't need
+                                     # working space).
+$::gPartialLineOutput = 0;           # True means that ntest has output the
+                                     # first part of the banner line for the
+                                     # current test before invoking it.  It's
+                                     # nice to see the test that is currently
+                                     # running, but if any other output
+                                     # occurs during the test will want to
+                                     # end this line so the output looks nice.
+$::gToolsDir = '';                   # Location of /usr/local/tools directory
+                                     # (must be non-Cygwin path on Windows).
+$::gTempDir = '';                    # Directory in which to create temporary
+                                     # files (platform-specific).
+$::gLogTestNames = 0;                # If non-zero, ntest logs test names to
+                                     # the ElectricCommander server.
+$::gLogServerStats = 0;              # If non-zero, ntest logs statistics
+                                     # between each test to the
+                                     # ElectricCommander server log.
+$::gTestFileDir = '';                # The directory of the currently
+                                     # executing test file.
+$::gOutTop = '';                     # The outtop for the build.
+$::gConstraintArg = '';              # Comma-separated list of constraints
+                                     # to allow.
+%::gConstraints = ();                # Constraints parsed into hash.
+
+$::gTest = '';                       # The name of the current test.
+
+# SMTP server globals
+$::gSmtpPort = 0;                    # the (dynamically determined)
+                                     # port to use for the SMTP server
+$::gSmtpServerPid = 0;               # the SMTP server PID
+$::gSmtpServerRunning = 0;
+
+# HTTP server globals
+$::gHttpUrl = '';
+$::gHttpServerRunning = 0;
+$::gHttpServerPid = 0;
+
+# Debug logging
+$::gDebug = 0;
+$::gDebug = $::ENV{COMMANDER_DEBUG} if (defined $::ENV{COMMANDER_DEBUG});
+$::gDebugFile = $::ENV{COMMANDER_DEBUGFILE};
+
+# Define a reusable parser with external entity resolution disabled.
+$::gParser = new XML::Parser(
+    ErrorContext => 2,
+    ParseParamEnt => 0,
+    Handlers => { ExternEnt => undef, Doctype => undef },
+);
+
+# If SRCTOP is defined, make it absolute.
+if (defined $ENV{SRCTOP}) {
+    $ENV{SRCTOP} = File::Spec->rel2abs($ENV{SRCTOP});
+}
+
+# ------------------------------------------------------------------------
+# Command-Line Options
+# ------------------------------------------------------------------------
+
+# Input for GetOptions:
+
+my %gOptions = (
+    "auxport=s"                             => \$::gAuxPort,
+    "constraints=s"                         => \$::gConstraintArg,
+    "dbname=s"                              => \$::gDbName,
+    "debug=s"                               => \$::gDebugLevel,
+    "docroot=s"                             => \$::gDocRoot,
+    "ectool=s"                              => \$::gECTool,
+    "help"                                  => \$::gHelp,
+    "match=s"                               => \$::gMatch,
+    "sslPort=s"                             => \$::gSslPort,
+    "start=s"                               => \$::gStart,
+    "quiet"                                 => \$::gQuiet,
+    "target=s"                              => \$::gTarget,
+    "testout=s"                             => \$::gTestOut,
+    "until=s"                               => \$::gUntil,
+    "untilFailure"                          => \$::gUntilFailure,
+    "urlroot=s"                             => \$::gUrlRoot,
+    "timeDetails"                           => \$::gTimeDetails,
+    "winagents=s"                           => \$::gWinAgents,
+    "linagents=s"                           => \$::gLinAgents,
+    "solagents=s"                           => \$::gSolAgents,
+    "sol86agents=s"                         => \$::gSol86Agents,
+    "hpuxagents=s"                          => \$::gHpuxAgents,
+    "macintelagents=s"                      => \$::gMacintelAgents,
+    "glibc22agents=s"                       => \$::gGlibc22Agents,
+    "macppcagents=s"                        => \$::gMacppcAgents,
+    "workspace=s"                           => \$::gWorkspace,
+    "outTop=s"                              => \$::gOutTop,
+    );
+
+# Help text to print in response to "-help":
+
+$::gHelpMessage = "Usage: ntest [options] file/dir file/dir ...
+
+Options:
+--auxport=port                 Port number to use for ntest-aux auxilary server
+                               (i.e., fakeElectricCommander or fakeAgent)
+--constraints=key1[,key2,...]  Set the specified constraint keys to true
+                               (ie, '--constraints=knownBug' will run tests
+                               marked 'knownBug')
+--dbname=name                  Name of the ElectricCommander database
+--debug=level                  One or more letters specifying optional
+                               information to log to standard output:
+                               d: debug (events related to test infrastructure)
+                               t: test debug (test-specific events)
+--docroot=path                 Directory on disk containing PHP files for the
+                               Web server being tested
+--ectool=cmdline               Full command line to invoke 'ectool'.
+--help                         Print this message and exit without running
+                               any tests
+--match=pattern                Only run tests whose names match this regexp
+                               pattern
+--start=pattern                Don't run any tests until a test whose name
+                               matches this pattern.
+--quiet                        Don't print info about tests that pass
+--target=hostname:port         Location of the component being tested.
+                               Defaults to localhost:443.
+--testout=path                 Directory in which test-specific files can
+                               be created
+--timeDetails                  If specified (and --quiet isn't specified),
+                               print the time of day after each test
+--until=pattern                Stop running tests once this pattern is seen
+--untilFailure                 Repeat each test (usually one) until it fails.
+--urlroot=path                 Location in the server's URL space of the
+                               directory containing Web PHP files.  For
+                               example, if --urlroot is \"ws41\" and
+                               --target is foo.bar.com:80, the URL for the
+                               root Web page will be
+                               http://foo.bar.com:80/ws41.  Defaults
+                               to commander
+--[win|lin|sol]agents=host     Hostnames of agents to use for each platform.
+--workspace=path               Path to the ElectricCommander workspace
+";
+
+# ------------------------------------------------------------------------
+# setClientTimeout
+#
+#       Change the client timeout in future connections.
+#       As a side-effect, it drops the connection cache.
+#
+# Arguments
+#       timeout         - (int) timeout in seconds
+# ------------------------------------------------------------------------
+
+sub setClientTimeout($) {
+    my ($timeout) = @_;
+
+    # Drop the cached connections.
+
+    $::gUserAgent->conn_cache()->drop();
+
+    # Set the timeout
+
+    $::gUserAgent->timeout($timeout);
+}
+
+# ------------------------------------------------------------------------
+# getClientTimeout
+#
+#       Returns the http client timeout, in seconds.
+# ------------------------------------------------------------------------
+
+sub getClientTimeout() {
+    return $::gUserAgent->timeout();
+}
+
+# ------------------------------------------------------------------------
+# httpMakeRequest
+#
+#    Execute an HTTP request.
+#
+# Arguments:
+#    request      - HTTP::Request object from http[Get|Post]
+# ------------------------------------------------------------------------
+
+sub httpMakeRequest($;$);
+sub httpMakeRequest($;$) {
+    my ($request, $retries) = @_;
+
+    # Hit the server. Note that if we get a 30x redirection on a method
+    # in requests_redirectably (by default, 'GET' and 'HEAD'), this
+    # method will keep requesting on our behalf.
+
+    $::gHTTPResponse = $::gUserAgent->request($request);
+
+    if (! $::gHTTPResponse->is_error) {
+        my $content =  $::gHTTPResponse->content();
+
+        my $contentEncoding = $::gHTTPResponse->header('Content-Encoding') || '';
+
+        # Do not alter the content if it is gzipped
+        if( $contentEncoding ne "gzip" ){
+          # Canonicalize CR-LF - see Camel book sec 25.1.
+          $content =~ s/\015?\012/\n/g;
+        }
+
+        mesg('DBG', "Response from server:\n$content\n");
+
+        return $content;
+    } elsif (defined($retries) && $retries > 0) {
+        return httpMakeRequest($request, $retries - 1);
+    }
+
+    # Something went wrong - record a test error.
+
+    mesg('ERR', "ntest HTTP error:\n" . $::gHTTPResponse->as_string()
+            . "\n");
+
+    $::gErrorMessages .= errorMessageHeader("http request ("
+                                            . $request->url() . ") failed");
+    $::gErrorMessages .= "----- Error information from HTTP::Response:\n"
+        . $::gHTTPResponse->error_as_HTML() . "\n";
+}
+
+# ------------------------------------------------------------------------
+# httpGet
+#
+#    Hit a URL using GET.
+#
+# Results:
+#    The return value is whatever is returned from the Web server as the
+#    data for the URL.  If an error occurs, then an empty string is
+#    returned and an error message is appended to $::gErrorMessages.
+#
+# Arguments:
+#    url          - The URL to hit at $::gTarget; may include GET
+#                   query data
+# ------------------------------------------------------------------------
+
+sub httpGet($;$) {
+    my ($url, $retries) = @_;
+
+    # Redirect debug output to the commander log
+    local *STDERR;
+    if ($::gCommander && $::gCommander->{logFile}) {
+        *STDERR = $::gCommander->{logger};
+    }
+
+    # Make the request.
+    my $proto = "http";
+    if ($::gUseHTTPS) {
+        $proto = "https";
+    }
+
+    mesg('DBG', "doing HTTP GET: $proto://$::gTarget/$url\n");
+    my $request = HTTP::Request->new("GET", "$proto://$::gTarget/$url");
+
+    return httpMakeRequest($request, $retries);
+}
+
+#-------------------------------------------------------------------------
+# baseUrl
+#
+#    Compute the base url for talking to the server being tested.
+#-------------------------------------------------------------------------
+
+sub baseUrl {
+    my $proto = "http";
+    if ($::gUseHTTPS) {
+        $proto = "https";
+    }
+    return "$proto://$::gTarget/$::gUrlRoot";
+}
+
+# ------------------------------------------------------------------------
+# httpPost
+#
+#    Hit a URL with POST data.
+#
+# Results:
+#    The return value is whatever is returned from the Web server as the
+#    data for the URL.  If an error occurs, then an empty string is
+#    returned and an error message is appended to $::gErrorMessages.
+#
+# Arguments:
+#    url            - The URL to hit at $::gTarget; may include GET
+#                     query data
+#    data           - Data to POST
+#    customHeaders  - hashref of HTTP header fields to append to the request
+# ------------------------------------------------------------------------
+
+sub httpPost($$%;$) {
+    my ($url, $data, $customHeaders, $retries) = @_;
+
+    mesg('DBG', "doing HTTP POST: https://$::gTarget/$url\n");
+    mesg('DBG', "data:\n$data\n");
+
+    # Redirect debug output to the commander log
+    local *STDERR;
+    if ($::gCommander && $::gCommander->{logFile}) {
+        *STDERR = $::gCommander->{logger};
+    }
+
+    # Create HTTP::Headers from supplied customHeaders values.
+
+    my $header = HTTP::Headers->new;
+    foreach my $h (keys %$customHeaders) {
+        $header->push_header($h => $customHeaders->{$h});
+    }
+
+    # Create the request object and execute it.
+
+    my $proto = "http";
+    if ($::gUseHTTPS) {
+        $proto = "https";
+    }
+    my $request = HTTP::Request->new("POST", "$proto://$::gTarget/$url",
+                                     $header, $data);
+    return httpMakeRequest($request, $retries);
+}
+
+# ------------------------------------------------------------------------
+# httpFormPost
+#
+#    Emulate a browser HTML form POST.
+#
+# Arguments;
+#    url         - relative URL to hit
+#    fields      - hashref of HTML form field name/value pairs
+# ------------------------------------------------------------------------
+
+sub httpFormPost($$;$) {
+    my ($url, $fields, $retries) = @_;
+    my $data;
+    my $amp = '';
+
+    foreach my $field (keys %$fields) {
+
+        # TODO - this should ensure that the data is properly URL-encoded.
+
+        $data .= "$amp$field=" . $fields->{$field};
+        $amp = "&";
+    }
+    return httpPost($url, $data, {
+        "Content-Type" => "application/x-www-form-urlencoded"
+    }, $retries);
+
+}
+
+sub httpPostXml($$) {
+    my ($url, $data, $customHeaders) = @_;
+    my $result = httpPost($url, $data, $customHeaders);
+    return new XML::XPath(xml => $result, parser => $::gParser);
+}
+
+# ------------------------------------------------------------------------
+# fakeServer
+# fakeSOAP
+#
+#    Wrappers around serverUp to set mode. See below for arguments.
+# ------------------------------------------------------------------------
+
+sub fakeServer {
+    serverUp(@_);
+}
+
+sub fakeSOAP {
+    soapServerUp(@_);
+}
+
+# ------------------------------------------------------------------------
+# serverUp
+#
+#    Create an HTTP server with canned responses to certain URLs.
+#
+# Results:
+#    None.
+#
+# Arguments:
+#    responses         - list of 'request', 'response' pairs.
+#
+# Side Effects:
+#    None
+# ------------------------------------------------------------------------
+
+sub serverUp($@) {
+    my (@responses) = @_;
+
+    # Iterate over responses, replacing response values
+    # with tmp file names that we've written the original value to.
+
+    my @args;
+    my $i = 0;
+    while (@responses > 0) {
+        my $request = shift @responses;
+        my $resp = shift @responses;
+        if ($resp eq "BLOCK") {
+            push @args, $request, $resp;
+        } else {
+            my $tmpfile = "response_" . $i++;
+            open (DEST, "> $tmpfile");
+            binmode(DEST => ':encoding(utf8)');
+            print (DEST "$resp");
+            close (DEST);
+            push (@args, $request, $tmpfile);
+        }
+    }
+
+    my $upfile = 'ntest-aux.up';
+
+    # Open a pipe to the server process to read from it.
+
+    # Clear the up file from last time.
+
+    unlink $upfile;
+
+
+    my $auxCommandLine = qq{"$^X" "$::gNTestDir/ntest-aux" } .
+                         "--log=ntest-aux.log " .
+                         "--upfile=ntest-aux.up " .
+                         "--port=$::gAuxPort " .
+                         join(' ',@args);
+
+    $::gServerPid = open(SERVER, "-|", $auxCommandLine);
+
+    # Wait (up to) a minute until the 'exists' file is created.
+
+    my $rin = '';
+    vec($rin,fileno(SERVER),1) = 1;
+    if (!select($rin, undef, undef, 60)) {
+        die "ntest error: no response from ntest-aux after 60s\n";
+    }
+    $::gAuxPort = <SERVER>;
+    $::gAuxPort =~ s/\s*listening on port (\d+)\n?/$1/;
+
+    # Add signal handler to shut down on exit
+
+    $SIG{INT}     = \&signalHandler;
+    $SIG{QUIT}    = \&signalHandler;
+    $SIG{KILL}    = \&signalHandler;
+
+    # Server is up and running.
+
+    mesg('DBG', "serverUp : pid=$::gServerPid : port=$::gAuxPort\n");
+}
+
+# ------------------------------------------------------------------------
+# soapServerUp
+#
+#    Create an HTTP server with canned responses to certain URLs.
+#
+# Results:
+#    None.
+#
+# Arguments:
+#    responses         - list of 'request', 'response' pairs.
+#
+# Side Effects:
+#    None
+# ------------------------------------------------------------------------
+
+sub soapServerUp(@) {
+
+    my ($datafile) = @_;
+
+    # Open a pipe to the server process to read from it.
+    # Clear the up file from last time.
+
+    my $existfile = "port-ntest-soap.log";
+
+    # delete exist file in case it was left over from prev test
+    unlink $existfile;
+
+    mesg('DBG', "starting server : port=$::gAuxPort\n");
+    my $cmdline = "\"$^X\" \"$::gNTestDir/soap/fakeSOAPServer.pl\" " .
+                  "--log=ntest-soap.log " .
+                    "--mode=run " .
+                  "--port=$::gAuxPort " .
+                  "--data=$datafile " ;
+    $::gServerPid = open(SERVER, "-|", $cmdline);
+
+
+    # Wait (up to) a minute until the 'exists' file is created.
+    my $timeout = 60;
+    while (! -f $existfile and $timeout > 0) {
+        $timeout -= 1;
+        sleep(1);
+    }
+
+    $::gAuxPort = `cat $existfile`;
+    #$::gAuxPort =~ s/^.*(\d+)\n?/$1/;
+
+    # Ping SOAP server until it responds to make sure we are up
+    my $serverReady = 0;
+    my $count = 1;
+    while ($count < 20) {
+        mesg('DBG', "pinging fakeSOAPServer $count\n");
+        $cmdline = "\"$^X\" \"$::gNTestDir/soap/fakeSOAPServer.pl\" " .
+          "--mode=ping --port=$::gAuxPort --log=ntest-soap.log";
+        my $serverReady = `$cmdline`;
+        $serverReady = substr($serverReady,0,1);
+        mesg('DBG', "ping returned[$serverReady]\n");
+        if ($serverReady eq "1") {
+            mesg('DBG', "fakeSOAPServer up and running after $count pings\n");
+            last;
+        }
+        $count++;
+    }
+
+    # Add signal handler to shut down on exit
+
+    $SIG{INT}     = \&signalHandler;
+    $SIG{QUIT}    = \&signalHandler;
+    $SIG{KILL}    = \&signalHandler;
+
+    # Server is up and running.
+    mesg('DBG', "serverUp : pid=$::gServerPid\n");
+
+}
+
+# ------------------------------------------------------------------------
+# signalHandler
+#
+#       Shuts down background servers and exits.  Used as a signal
+#       handler while the server is up so we don't leave the process
+#       hanging.
+#
+# Arguments:
+#       None
+#
+# Side Effects:
+#       Exits
+# ------------------------------------------------------------------------
+sub signalHandler() {
+    mesg('ERR', "signal caught....shutting down background servers \n");
+    serverDown();
+    soapServerDown();
+    smtpServerDown( "Forced shutdown of the SMTP server");
+    httpServerDown();
+    exit(1);
+}
+
+# ------------------------------------------------------------------------
+# soapServerDown;
+#
+#       Shuts down the server and exits.  Used as a signal handler while
+#       the server is up so we don't leave the process hanging.
+#
+# Arguments:
+#       None
+#
+# Side Effects:
+#       Exits
+# ------------------------------------------------------------------------
+sub soapServerDown () {
+
+    # Shutdown the server nicely.
+    if (defined($::gServerPid) && $::gServerPid != 0) {
+        my $link = "quit";
+
+        mesg('DBG', "shutting down server ");
+        my $cmd = "\"$^X\" \"$::gNTestDir/soap/fakeSOAPServer.pl\" --mode stop "
+            . " --log ntest-soap.log"
+            . " --port $::gAuxPort";
+        `$cmd`;
+
+        my $recordSep = $/;
+        undef $/;
+        $::gServerDump = <SERVER>;
+        $/ = $recordSep;
+        mesg('DBG', "server dump:\n$::gServerDump\n");
+
+
+        # Wait for the server to exit. (close will wait on pid)
+        mesg('DBG', "waiting for HTTP server pid=$::gServerPid to exit\n");
+        eval {
+            close SERVER;
+        };
+
+
+        # Reset gServerPid so runtests knows it doesn't have to shut it down.
+        $::gServerPid = 0;
+
+        mesg('DBG', "SOAP server down\n");
+    }
+}
+
+# ------------------------------------------------------------------------
+# dieHandler
+#
+#       Shuts down the server and exits.  Used a __DIE__ handler while
+#       the server is up so we don't leave the process hanging.
+#
+# Arguments
+#       None
+#
+# Side Effects
+#       Shuts down the server.
+# ------------------------------------------------------------------------
+
+sub dieHandler($) {
+    my ($message) = @_;
+
+    serverDown();
+    die($message);
+}
+
+# ------------------------------------------------------------------------
+# serverDown
+#
+#    Tear down the server started previously by 'serverUp'.
+#
+# Arguments:
+#       dumpLog         - (boolean) If true, the log is dumped out in a
+#                                   perl-readable format.
+#
+# Results:
+#    None.
+#
+# Side Effects:
+#    Reads the server's history into $::gServerLog.
+# ------------------------------------------------------------------------
+sub serverDown() {
+
+    # Shutdown the server nicely.
+
+    if ($::gServerPid != 0) {
+        my $link = "quit";
+
+        mesg('DBG', "shutting down server "
+             . "http://localhost:$::gAuxPort/$link\n");
+
+        # Drop any cached connections.
+        $::gConnCache->drop();
+
+        # Occasionally, we fail to shut down ntest-aux gracefully.  Retry a
+        # a few times.  Report the error messages if we don't succeed
+        # after enough retries.
+
+        my $errBuf = "";
+        my $didSucceed = 0;
+        for (my $ctr = 0; $ctr < 3 && !$didSucceed; $ctr++) {
+            my $request = HTTP::Request->new("GET",
+                                             "http://localhost:$::gAuxPort/$link");
+            $::gHTTPResponse = $::gUserAgent->request($request);
+            if ($::gHTTPResponse->is_error) {
+                # There was a protocol error (as opposed to ntest-aux
+                # returning an error response).
+
+                $errBuf .= sprintf("Error sending '/$link' request to " .
+                                   "ntest-aux: %s\n",
+                                   $::gHTTPResponse->as_string());
+            } else {
+                # Success! No need to retry.
+                $didSucceed = 1;
+            }
+        }
+        if (!$didSucceed) {
+            mesg('ERR', $errBuf);
+        }
+
+        # Evaluate the server's stdout to populate gServerLog.
+
+        my $recordSep = $/;
+        undef $/;
+        $::gServerDump = <SERVER>;
+        $/ = $recordSep;
+        mesg('DBG', "server dump:\n$::gServerDump\n");
+
+        $::gServerLog = "";
+        $::gServerLog = XML::XPath->new(xml => $::gServerDump,
+                                        parser => $::gParser)
+                        unless ($::gServerDump eq "");
+
+        # Wait for the server to exit. (close will wait on pid)
+
+        mesg('DBG', "waiting for HTTP server pid=$::gServerPid to exit\n");
+        close SERVER;
+
+        # Reset gServerPid so runtests knows it doesn't have to shut it down.
+
+        $::gServerPid = 0;
+
+        mesg('DBG', "HTTP server down\n");
+    }
+}
+
+# ------------------------------------------------------------------------
+# savePhpConfig
+#
+#    This subroutine saves the copy of the Web server's current
+#    "config_ntest.php" file, so we can override it with a different one
+#    for testing purposes.
+#
+# Results:
+#    None.
+#
+# Side Effects:
+#    Windows procedure returns, there will be no config_ntest.php file.  The
+#    previous version will be saved under a different name.  Generates
+#    an exception if there is a system call failure.
+#
+# Arguments:
+#    None.
+# ------------------------------------------------------------------------
+
+sub savePhpConfig() {
+    if ($::gConfigSaved) {
+        # There's already a saved file that hasn't been restored.  No
+        # need to save again.
+
+        unlink "$::gDocRoot/config_ntest.php";
+        return;
+    }
+
+    $::gConfigSaved = 1;
+    if ((-e "$::gDocRoot/config_ntest.php.ntest")
+            && (-e "$::gDocRoot/config_ntest.php")
+            && (readFile("$::gDocRoot/config_ntest.php")
+            =~ /placed here by ntest while running tests/)) {
+        # Looks like an earlier test crashed in the middle, leaving an
+        # existing saved file. Furthermore, the "official" version looks
+        # a temporary one that we created.  Delete the temporary one and
+        # retain the saved version.
+
+        unlink "$::gDocRoot/config_ntest.php";
+        return;
+    }
+
+    # Rename the existing config_ntest.php file in the PHP directory.
+
+    if (-e "$::gDocRoot/config_ntest.php") {
+        rename("$::gDocRoot/config_ntest.php", "$::gDocRoot/config_ntest.php.ntest")
+                or die "ntest error: savePhpConfig couldn't rename "
+                . "$::gDocRoot/config_ntest.php: $!";
+        $::gRestoreConfig = 1;
+    }
+}
+
+# ------------------------------------------------------------------------
+# restorePhpConfig
+#
+#    Undoes the effect of a previous call to savePhpConfig.
+#
+# Results:
+#    None.
+#
+# Side Effects:
+#    The Web server's original version of config_ntest.php is restored (if
+#    there was one).  If there was no saved version, this subroutine
+#    just deletes the temporary version of config_ntest.php.  An exception
+#    is generated if an error occurs.
+#
+# Arguments:
+#    None.
+# ------------------------------------------------------------------------
+
+sub restorePhpConfig() {
+    mesg('DBG', "restorePhpConfig: restoring $::gDocRoot/config_ntest.php\n");
+    if ($::gConfigSaved) {
+        $::gConfigSaved = 0;
+        unlink "$::gDocRoot/config_ntest.php";
+        if ($::gRestoreConfig) {
+            rename("$::gDocRoot/config_ntest.php.ntest", "$::gDocRoot/config_ntest.php")
+                    or die "ntest error: restorePhpConfig couldn't restore "
+                    . "$::gDocRoot/config_ntest.php: $!";
+            $::gRestoreConfig = 0;
+        }
+    }
+}
+
+# ------------------------------------------------------------------------
+# pokeWebServer
+#
+#    This subroutine provides the basic mechanism for testing the Web
+#    server.  It configures the Web server to use "ntestServer" as a
+#    stand-in for the ElectricCommander server and pre-arranges responses
+#    for any requests the Web server might make of the ElectricCommander
+#    server.  Then it issues a GET or POST request to the Web server,
+#    waits for a response, and returns a list containing the response and
+#    the contents of any requests made of the ElectricCommander server.
+#
+# Results:
+#    The return value is an array whose first element is whatever is
+#    returned from the Web server as the data for the URL.  If the document
+#    contains a "DOCTYPE" specification at the beginning, it is removed
+#    (the reference to a URL at w3.org tends to slow down later processing
+#    of the document).  The second element of the result will be the
+#    contents of the ElectricCommander server request made by the Web
+#    server while processing that URL, or an empty string if the Web
+#    server made no requests.  If the Web server makes multiple requests,
+#    then each request will be a separate element of the result.  If an
+#    error occurs, then an empty string is returned and an error message is
+#    appended to $::gErrorMessages.
+#
+# Arguments:
+#    url          - The URL to hit at $::gTarget, specified relative to the
+#                   ElectricCommander root; may include GET query data
+#    postData     - Data for POST. "" means use a GET request instead
+#                   of POST.  "-" means send a POST request with no
+#                   POST data.
+#    response...  - Any number of additional arguments; each argument
+#                   contains the response for one ElectricCommander
+#                   server request.  Each response consists of the XML
+#                   inside the <responses> element; we automatically wrap
+#                   it with additional XML as appropriate.
+# ------------------------------------------------------------------------
+
+sub pokeWebServer($$@) {
+    my ($url, $postData, @responses) = @_;
+    $url = "https://$::gTarget/$::gUrlRoot/$url";
+
+    savePhpConfig();
+
+    # Create a new config_ntest.php file in the PHP directory to arrange for
+    # "ntestServer" to act as ElectricCommander server for the test.  This is
+    # the same server and port as the Web server.
+
+    my $f;
+    open($f, "> $::gDocRoot/config_ntest.php")
+            or die "ntest error: pokeWebServer couldn't open "
+                    . $::gDocRoot . "/config_ntest.php: $!";
+    binmode $f;
+    printf($f "%s\n", '<?php');
+    printf($f "%s\n", '// This is a temporary version of config_ntest.php');
+    printf($f "%s\n", '// placed here by ntest while running tests.');
+    printf($f "%s\n", '// It should be deleted when the tests finish.');
+    printf($f "%s\n", '$skipLoginCheck = true;');
+    my ($host, $port) = split(/:/, $::gTarget);
+    printf($f "%s\n", '$config["serverHost"] = "' . $host . '";');
+    printf($f "%s\n", '$config["serverPort"] = "' . $port . '";');
+    printf($f "%s\n", '$config["sslPort"] = "' . $::gSslPort . '";');
+    printf($f "%s\n", '$config["baseUrl"] = "/' . $::gUrlRoot . '/";');
+    printf($f "%s\n", '$config["requestURL"] = "/' . $::gUrlRoot
+            . '/ntestServer.php";');
+    printf($f "%s\n", '$_SESSION["ignoreUserSettings"] = true;');
+    printf($f "%s\n", '$_SESSION["ignoreHistory"] = true;');
+    if ($::gConfigCode) {
+        printf($f "%s\n", $::gConfigCode);
+        $::gConfigCode = '';
+    }
+    printf($f "%s\n", '?>');
+    close $f or die "ntest error: pokeWebServer couldn't close "
+            .$::gDocRoot . "/config_ntest.php: $!";
+
+    # We use shared files to tell the server what responses to return,
+    # and for the server to tell us what requests it received.  However,
+    # we have had problems (as of 10/30/2005) using the build directory
+    # for these shared files: on Windows if the Web server runs as "local
+    # user" it can't create files in directories we created.  To get around
+    # this problem, use files in a temporary directory that everyone can
+    # access, and create a file in the docroot directory that tells the
+    # server where the real files are.
+
+    my $requestFile = "$::gTempDir/ntest.requests";
+    my $responseFile = "$::gTempDir/ntest.responses";
+    open($f, "> $::gDocRoot/ntest.files")
+            or die "ntest error: pokeWebServer couldn't open "
+                    . $::gDocRoot . "/ntest.files: $!";
+    binmode $f;
+    printf($f "%s\n%s\n", $requestFile, $responseFile);
+    close $f;
+
+    # Save the response messages in a file where ntestServer can
+    # access them.  The file format consists of a line containing
+    # the length in bytes of the first response, followed by the
+    # data for that response, followed by a line containing the length
+    # of the next response, and so on.
+
+    mesg('DBG', "pokeWebServer: creating $responseFile\n");
+    if (@responses) {
+        open($f, "> $responseFile")
+                or die "ntest error: pokeWebServer couldn't open "
+                        . "$responseFile: $!";
+        binmode $f;
+        foreach my $response (@responses) {
+            $response = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    . "<responses>\n" . $response . "\n</responses>\n";
+            printf($f "%d\n%s", length($response), $response);
+            mesg('DBG', "pokeWebServer response: $response\n");
+        }
+        close $f
+                or die "ntest error: pokeWebServer couldn't close "
+                        . "$responseFile: $!";
+
+        # Make sure the Web server can modify the response file (to
+        # remove responses from after it has sent them).
+
+        chmod 0777, $responseFile;
+    }
+
+    # If there is an old request file lying around, empty it by opening
+    # and closing it.  Deleting it would be cleaner, but we can't always
+    # do that (e.g., as of 10/30/2005 on Linux, the file gets created by
+    # user "apache"; we are running as user "build" and can't delete the
+    # even though it is protected 0777; however, we can overwrite it).
+
+    if (-e $requestFile) {
+        open($f, "> $requestFile");
+        close $f;
+    }
+
+    # Make the request.
+
+    my $op = ($postData eq '') ? "GET" : "POST";
+    if ($postData eq "-") {
+        $postData = '';
+    }
+    mesg('DBG', "pokeWebServer: doing HTTP $op at $url\n");
+    mesg('DBG', "pokeWebServer POST data: $postData\n");
+    my $header = HTTP::Headers->new(@::gHTTPHeaders);
+    if (($op eq "POST") && !$::gRawPost) {
+        $header->push_header("Content-Type",
+                "application/x-www-form-urlencoded");
+    }
+    @::gHTTPHeaders = ();
+    $::gRawPost = 0;
+    my $request = HTTP::Request->new($op, $url, $header, $postData);
+    $::gHTTPResponse = $::gUserAgent->request($request);
+    if ($::gHTTPResponse->is_error) {
+        # Something went wrong - record a test error.
+
+        $::gErrorMessages .= errorMessageHeader("$op $url failed: "
+                . $::gHTTPResponse->as_string);
+    }
+
+    # Retrieve the requests saved by ntestServer (the request file has
+    # the same format as the response file: a line containing a count,
+    # followed by that many bytes).
+
+    mesg('DBG', "pokeWebServer: retrieving server requests\n");
+    my $html = $::gHTTPResponse->decoded_content;
+    if ($::gKeepDoctype) {
+        $::gKeepDoctype = 0;
+    } else {
+        $html =~ s/<!DOCTYPE[^>]*>\n?//;
+    }
+    my @result = ($html);
+    if (open($f, "< $requestFile")) {
+        mesg('DBG', "pokeWebServer: opened $requestFile\n");
+        while (my $length = <$f>) {
+            my $request;
+            read($f, $request, $length);
+            push(@result, $request);
+        }
+        close $f;
+    }
+    if (@result == 1) {
+        push(@result, '');
+    }
+
+    # Restore the old version of config_ntest.php, if we saved one, and delete
+    # the test-specific files.
+
+    restorePhpConfig();
+    if (!$::gSaveFiles) {
+        unlink $responseFile;
+        unlink $requestFile;
+        unlink "$::gDocRoot/ntest.files";
+    } else {
+        $::gSaveFiles = 0;
+    }
+
+    return @result;
+}
+
+# ------------------------------------------------------------------------
+# evalOnWebServer
+#
+#    This subroutine provides an alternate mechanism for testing the Web
+#    server, where an arbitrary chunk of PHP code gets executed.  This
+#    is most useful for low-level unit tests, where you want to call
+#    specific functions and check their output.
+#
+# Results:
+#    The return value is whatever is returned from the Web server as
+#    the data for the URL.  If the document contains a "DOCTYPE"
+#    specification at the beginning, it is removed (the reference to a
+#    URL at w3.org tends to slow down later processing of the document).
+#    If an error occurs, then an empty string is returned and an error
+#    message is appended to $::gErrorMessages.
+#
+# Arguments:
+#    code         - PHP script to execute in the Web server.
+# ------------------------------------------------------------------------
+
+sub evalOnWebServer($) {
+    my ($code) = @_;
+    $::gRawPost = 1;
+    my ($result) = pokeWebServer("evalPhp.php", $code);
+    return $result;
+}
+
+# ------------------------------------------------------------------------
+# createPrivateDirs
+#
+#      This subroutine specifies whether a private directory should be
+#      created for each test.
+#
+# Results:
+#      None.
+#
+# Side Effects:
+#      This value is retained throughout the current test file, but is
+#      reset to a default at the beginning of the next test file.
+#
+# Arguments:
+#      create       - (boolean) True means create a private directory for
+#                     the use of each test; false means don't.
+# ------------------------------------------------------------------------
+
+sub createPrivateDirs($) {
+    $::gCreatePrivateDirs = $_[0];
+}
+
+
+#-------------------------------------------------------------------------
+# initConstraints
+#
+#       Initialize the table of constraints by testing various conditions.
+#       Any constraints set on the command line are applied last so they
+#       take precedence.
+#-------------------------------------------------------------------------
+
+sub initConstraints {
+    %::gConstraints = (
+        notAroundMidnight => !aroundMidnight(),
+        haveSolAgent => $::gSolAgents,
+        haveSol86Agent => $::gSol86Agents,
+        haveHpuxAgent => $::gHpuxAgents,
+        haveMacintelAgent => $::gMacintelAgents,
+        haveGlibc22Agent => $::gGlibc22Agents,
+        haveMacppcAgent => $::gMacppcAgents,
+        haveLinAgent => $::gLinAgents,
+        haveWinAgent => $::gWinAgents,
+        notWindows => !isWindows(),
+        notWindows2008 => !isWindows2008(),
+        windowsOnly =>  isWindows(),
+        linuxOnly =>  isLinux(),
+        linuxUTF8Only =>  isLinuxUTF8(),
+        haveScmAgent => $ENV{RUNSCMTESTS}
+    );
+    if ($::gTarget =~ /^localhost/)
+    {
+        $::gConstraints{localWebServerOnly} = 1;
+    }
+    if (defined($ENV{COMMANDER_TIMING_SENSITIVE_TESTS})
+        && $ENV{COMMANDER_TIMING_SENSITIVE_TESTS})
+    {
+        $::gConstraints{allowTimingSensitiveTests} = 1;
+    }
+
+    # Override constraint default values with command line values
+    my @constraintArgs = split(',', $::gConstraintArg);
+    @::gConstraints{@constraintArgs} = (1) x @constraintArgs;
+}
+
+# ------------------------------------------------------------------------
+# checkConstraints
+#
+#      Check the constraints on the test attributes.
+#      Returns true if the test can run.
+#
+# Arguments:
+#      attrs      - (ref hash) properties for this test
+# ------------------------------------------------------------------------
+
+sub checkConstraints(%) {
+    my ($attrs) = @_;
+
+    # Look for any constraints that evaluate to false.
+    my $result = grep {!$_} @::gConstraints{keys %{$attrs}};
+    return $result == 0;
+}
+
+# ------------------------------------------------------------------------
+# aroundMidnight
+#
+# Results:
+#       Returns true if local time is right before midnight (within five
+#       minutes of either side of midnight, to be precise).
+#
+# Arguments:
+#       time - the time to test.  Optional, if not provided, current time is
+#              used.
+# ------------------------------------------------------------------------
+
+sub aroundMidnight(;$) {
+    my ($time) = @_;
+
+    $time = time() unless defined($time);
+
+    my ($sec, $min, $hours) = localtime($time);
+
+    return $hours == 23 && $min >= 55 || $hours == 0 && $min <= 5;
+}
+
+# ------------------------------------------------------------------------
+# ntest
+#
+#      Run a single test.
+#
+# Results:
+#      Always returns 1 (as a convenience to keep the outermost "do"
+#      that reads a test file from seeming to fail).
+#
+# Arguments:
+#      name       - (string) name of the test
+#      attrs      - (ref hash) properties for this test
+#      body       - (ref code) closure to execute: contains actual test
+#                   code
+# ------------------------------------------------------------------------
+
+sub ntest($$$) {
+    my ($name, $attrs, $body) = @_;
+
+TESTRUN:
+
+    my $start_time = time();
+
+    $::gErrorMessages = '';
+    $::gTotalTests++;
+    $::gTestName = $name;
+
+    # Make sure the banner contains at least 4 dots in a row (this is
+    # used by output processors).
+
+    my $banner = $name . " " . ('.' x (61 - length($name))) . "....";
+    $::gPartialLineOutput = 0;
+    if (!$::gQuiet) {
+        # Start printing the banner for this test.  If we are not in quiet
+        # we won't print the banner unless there is a test error.
+
+        mesg('TEST', $banner);
+        $::gPartialLineOutput = 1;
+    }
+
+    # Check 'start' pattern to skip tests until we see the start pattern
+
+    if ($::gStart) {
+        if ($name =~ /$::gStart/) {
+            # We've seen the starting pattern, so allow tests to run from this
+            # point on
+            $::gStart = '';
+        } else {
+            $::gPartialLineOutput = 0;
+            if (!$::gQuiet) {
+                mesg('TEST', "SKIPPED\n");
+            }
+            $::gSkippedTests++;
+            return 1;
+        }
+    }
+
+    # Check 'until' pattern to skip tests after we see this pattern
+
+    if ($::gUntil && ($::gUntil eq 'UNTIL' || $name =~ /$::gUntil/)) {
+        $::gPartialLineOutput = 0;
+        if (!$::gQuiet) {
+            mesg('TEST', "SKIPPED\n");
+        }
+        $::gSkippedTests++;
+        # Set this so we skip everything from hereon
+        $::gUntil = 'UNTIL';
+        return 1;
+    }
+
+    # Check constraints and match pattern to skip this test.
+
+    if (($::gMatch && !($name =~ /$::gMatch/)) || ! checkConstraints($attrs)) {
+        $::gPartialLineOutput = 0;
+        if (!$::gQuiet) {
+            mesg('TEST', "SKIPPED\n");
+        }
+        $::gSkippedTests++;
+        return 1;
+    }
+
+    # Log a message on the server
+    if ($::gCommander) {
+        $::gCommander->logMessage("$::gTestFile:$banner",
+                                  {level  => "info",
+                                   logger => "ntest"}) if $::gLogTestNames;
+    }
+
+    $::gTestOut = Cwd::abs_path($::gTestOut);
+
+    # Create a working directory for the test, if requested, cd to it,
+    # and run the command.
+
+    if ($::gCreatePrivateDirs) {
+        # Substitute illegal path characters with "_".
+        my $cleanName = $name;
+        $cleanName =~ s/[:;]/_/g;
+        $::gCurrentTestDir = "$::gTestOut/$cleanName";
+
+        # If we are creating a private working directory for each test,
+        # then clear its previous contents.  If all tests use the same
+        # top-level directory, then don't do the delete.
+
+        File::Path::rmtree($::gCurrentTestDir);
+    } else {
+        $::gCurrentTestDir = "$::gTestOut";
+    }
+
+    if (!-d $::gCurrentTestDir) {
+        mesg('DBG', "making directory: $::gCurrentTestDir\n");
+        mkdir $::gCurrentTestDir or die "ntest error: Couldn't create test "
+            . "working directory \"$::gCurrentTestDir\": $!";
+    }
+
+    chdir $::gCurrentTestDir or die "ntest error: couldn't change to test "
+            . "working directory \"$::gCurrentTestDir\": $!";
+
+    eval {
+        my $oldDeath = $SIG{__DIE__};
+        $SIG{__DIE__} = \&captureStackTrace;
+        our $gTest = $name;
+        &$body();
+
+        $SIG{__DIE__} = $oldDeath;
+    };
+    if ($@) {
+        # An exception occurred during the test: log an error.
+
+        $::gErrorMessages .= "unexpected exception occurred during "
+            . "test:\n$@\n" . $::gStackTrace;
+
+        # Clear out the stack trace
+
+        $::gStackTrace = '';
+    }
+
+    # Dump statistics on the server, and reset them for the next test.
+    if ($::gCommander) {
+        $::gCommander->dumpStatistics({
+            dumpLapTimes    => 1,
+            clearStatistics => 1}) if $::gLogServerStats;
+    }
+    chdir($::gWorkingDirectory) or die "ntest error: couldn't restore "
+            . "working directory to \"$::gWorkingDirectory\": $!";
+
+    if ($::gPartialLineOutput) {
+        $banner = '';
+    }
+    $::gPartialLineOutput = 0;
+    if ($::gErrorMessages) {
+        # This test had errors; log them.  Indent the error messages
+        # so that it's easy for postprocessors to separate error messages
+        # from surrounding text.
+
+        $::gFailedTests++;
+        my $indentedMessage = "\n$::gErrorMessages";
+        $indentedMessage =~ s|\n|\n    |g;
+        mesg('TEST', "%s", $banner . " FAILED$indentedMessage\n");
+        push(@::gFailedTestCollector, $name . "\n  ");
+    } else {
+        if (!$::gQuiet) {
+            mesg('TEST', "%s", $banner . " PASSED\n");
+        }
+
+        if ($::gUntilFailure) {
+            goto TESTRUN;
+        }
+    }
+
+    # Collect the duration for this test.
+
+    my $duration = time() - $start_time;
+    $::gTestTimes{$name} = $duration;
+
+    if ($::gTimeDetails && !$::gQuiet) {
+        # Print timing information to help find slow tests.
+
+        mesg('TEST', "%s\n", (scalar localtime()));
+    }
+    return 1;
+}
+
+# ------------------------------------------------------------------------
+# captureStacktrace
+#
+#       __DIE__ handler used during ntest eval() to produce a stacktrace
+#
+# ------------------------------------------------------------------------
+
+sub captureStackTrace($) {
+    my ($error) = @_;
+
+    $::gStackTrace = "Caught" . Carp::longmess();
+}
+
+# ------------------------------------------------------------------------
+# readFile
+#
+#      Return the contents of a given file, or an empty string if the file
+#      can't be read or doesn't exist.
+#
+# Arguments:
+#      fileName       - (string) name of the file
+#      allowNonExistentFile - (bool) whether or not to treat a non-existent
+#                     file as empty. 0 means block until it exists;
+#                     1 means treat it as empty.  Defaults to 0.
+#      encoding       - (string) Optional. Encoding to use.
+#      timeout        - time (in seconds) after which we give up. Defaults
+#                       to 30.
+# ------------------------------------------------------------------------
+
+sub readFile($;$$$) {
+    my ($fileName, $allowNonExistentFile, $encoding, $timeout) = @_;
+    my $result = '';
+    my $buffer;
+    my $f;
+
+    # Try reading the file over and over until we succeed or exceed the
+    # timeout.
+    $timeout = 30 unless defined($timeout);
+    my $expireTime = time() + $timeout;
+    my $success = 0;
+    while (time() < $expireTime) {
+        if (open($f, "< $fileName")) {
+            if ($encoding) {
+                binmode($f => ':encoding(' . $encoding . ')');
+            }
+            local $/;
+            $result = <$f>;
+            close($f);
+
+            if ($result =~ m/\0\0/) {
+                sleep 2;
+            } else {
+                $success = 1;
+                last;
+            }
+        } else {
+            # The file doesn't exist or isn't readable.  Sleep for 2 seconds
+            # and then try again, unless we've been told that file non-
+            # existence is ok.
+
+            if ($allowNonExistentFile) {
+                $success = 1;
+                last;
+            } else {
+                sleep 2;
+            }
+        }
+    }
+
+    # If the file was invalid, error out.  Otherwise, return the file contents.
+    if (!$success) {
+        mesg("ERR", "ntest error: readFile didn't find a valid file $fileName "
+                . "after $timeout seconds\n");
+    } else {
+        return $result;
+    }
+}
+
+# ------------------------------------------------------------------------
+# writeFile
+#
+#      Write a string value to a given file.
+#
+# Arguments:
+#      fileName       - (string) Name of the file
+#      data           - (string) New contents for the file
+#      encoding       - (string) Optional. File encoding to use.
+# ------------------------------------------------------------------------
+
+sub writeFile($$;$) {
+    my ($fileName, $data, $encoding) = @_;
+    my $f;
+    if (open($f, "> $fileName")) {
+        if($encoding) {
+           binmode($f => ':encoding(' . $encoding . ')');
+        } else {
+           binmode $f;
+        }
+        printf($f "%s", $data);
+        if (close($f)) {
+            return;
+        }
+    }
+
+    # Couldn't write the file; record a test error.
+
+    $::gErrorMessages .= errorMessageHeader("writeFile couldn't create"
+            . "\"$fileName\"");
+    $::gErrorMessages .= "----- System error message:\n"
+            . $! . "\n";
+}
+
+# ------------------------------------------------------------------------
+# lines
+#
+#      Given a bunch of strings, this subroutine joins them together
+#      with newline separators.
+#
+# Results:
+#      The return value is the new string.
+#
+# Arguments:
+#      string ...       - (string) Any number of strings to be joined
+# ------------------------------------------------------------------------
+
+sub lines(@) {
+    join("\n", @_);
+}
+
+# ------------------------------------------------------------------------
+# outdent
+#
+#      This subroutine is used when text such as XML documents is
+#      included in indented code such as tests.  We want to indent the
+#      XML in the test code, to maximize readability, but want the
+#      indentation removed when the XML is actually use.  This subroutine
+#      serves that purpose.
+#
+# Results:
+#      The return value is a new string consisting of argument, outdented
+#      as indicated by the "|" on the first line.
+#
+# Arguments:
+#      string           - (string) String to outdent.  The first line must
+#                         start with zero or more space characters,
+#                         followed by a "|".  The "|" character
+#                         indicates how much space should be
+#                         removed from the beginning of every
+#                         line in the strings: the character just
+#                         after the "|" will appear at the left
+#                         edge of the line.
+# ------------------------------------------------------------------------
+
+sub outdent($) {
+    my ($string) = @_;
+
+    # Find the indicator, and also replace it with a space, so it can be
+    # further replaced in the next substitution.  Also remove initial
+    # newlines.
+
+    if ($string !~ s/\A\n*( *)\|/$1 /) {
+        # No indicator: just return the original string.
+
+        return $string;
+    }
+    my $prefix = "$1 ";
+
+    # The following substitution does the actual outdenting by deleting
+    # initial space on each line.
+
+    $string =~ s/^$prefix//gm;
+    return $string;
+}
+
+# ------------------------------------------------------------------------
+# getTableElement
+#
+#      This subroutine picks out an element of the table, given its
+#      row and column names.
+#
+# Results:
+#      The return value is the XML::XPath::Node for the selected element,
+#      or undef if there is no such element.
+#
+# Arguments:
+#      xpath                     - (XML::XPath) Document containing the
+#                                  table.
+#      tablePath                 - (string) XPath string identifying the
+#                                  <table> element for the table.  If there
+#                                  are multiple such elements, each is
+#                                  searched and first matching element
+#                                  is returned.
+#      rowPattern                - (string) The desired row is the first
+#                                  one containing text in its first element
+#                                  that matches this pattern.
+#      columnPattern             - (string) The desired column is the first
+#                                  one (at or above the desired row)
+#                                  with an element containing text that
+#                                  matches this pattern.
+#      rowIndex                  - (integer, optional) If there are several
+#                                  rows starting with the same rowPattern,
+#                                  this index selects which one to use.
+#                                  The default value is 0.
+# ------------------------------------------------------------------------
+
+sub getTableElement {
+    my ($xpath, $tablePath, $rowPattern, $columnPattern, $rowIndex) = @_;
+    if (!$rowIndex) {
+        $rowIndex = 0;
+    }
+
+    my $tables = $xpath->findnodes($tablePath);
+    if (!$tables->isa("XML::XPath::NodeSet")) {
+        return undef;
+    }
+
+    # Iterator over all of the tables and all of the rows of each table.
+
+    foreach my $table ($tables->get_nodelist) {
+        my $column = -1;
+        foreach my $row ($xpath->findnodes(".//tr", $table)->get_nodelist) {
+            my $elements = $xpath->findnodes("td", $row);
+            my $length = $elements->size();
+
+            # If we have already figured out which column to use, see if
+            # this row matches; if it does, return the appropriate element.
+
+            if ($column >= 0) {
+                if ($elements->string_value =~ $rowPattern) {
+                    if ($rowIndex == 0) {
+                        return $elements->get_node($column + 1);
+                    } else {
+                        $rowIndex --;
+                    }
+                }
+            } else {
+                # We haven't already selected a column; see if this row
+                # identifies the desired column.
+
+                my $i = 0;
+                foreach my $element ($elements->get_nodelist) {
+                    if ($element->string_value =~ $columnPattern) {
+                        $column = $i;
+                        last;
+                    }
+                    $i++;
+                }
+            }
+        }
+    }
+    return undef;
+}
+
+# ------------------------------------------------------------------------
+# tableElementHtml
+#
+#      Find an element in a table, and return the HTML for that element.
+#
+# Results:
+#      The return value is the HTML comprising the selected element,
+#      or an empty string if there is no such element.
+#
+# Arguments:
+#      Same as for getTableElement.
+# ------------------------------------------------------------------------
+
+sub tableElementHtml($$$$;$) {
+    my $element = getTableElement @_;
+    if (!$element) {
+        return '';
+    }
+    return $element->toString;
+}
+
+# ------------------------------------------------------------------------
+# tableElementText
+#
+#      Find an element in a table, and return its text.
+#
+# Results:
+#      The return value is the text contained in the selected element,
+#      or an empty string if there is no such element.
+#
+# Arguments:
+#      Same as for getTableElement.
+# ------------------------------------------------------------------------
+
+sub tableElementText($$$$;$) {
+    my $element = getTableElement @_ ;
+    if (!$element) {
+        return '';
+    }
+    return $element->string_value;
+}
+
+# ------------------------------------------------------------------------
+# tableElementHrefs
+#
+#      Return all of the URLs found in links in a table element.
+#
+# Results:
+#      If the specified element contains one or more <a href=...>
+#      elements, return a list of URLs from those elements.  If there
+#      are no hrefs in the element, return an empty list.
+#
+# Arguments:
+#      Same as for getTableElement.
+# ------------------------------------------------------------------------
+
+sub tableElementHrefs($@) {
+    my $xpath = $_[0];
+    my $element = getTableElement @_ ;
+    my @result = ();
+    if (!$element) {
+        return @result;
+    }
+    foreach my $href ($xpath->findnodes(".//a", $element)->get_nodelist) {
+        my $url = $href->getAttribute("href");
+        if ($url eq "") {
+            # An "onclick" handler may be used instead of an "href".
+
+            $url = $href->getAttribute("onclick");
+            if ($url eq "") {
+                next;
+            } else {
+                my $index = index($url, "window.location.href = ");
+                if ($index >= 0) {
+                    $url = substr($url, $index + 24, -2);
+                }
+            }
+        }
+        push(@result, $url);
+    }
+    return @result;
+}
+
+# ------------------------------------------------------------------------
+# getHrefs
+#
+#      Return all of the URLs found in links in a specified set of elements.
+#
+# Results:
+#      If any of the specified elements contain <a href=...>
+#      elements, return a list of URLs from those elements.  If no
+#      matching hrefs are found, return an empty list.
+#
+# Arguments:
+#      xpath                     - (XML::XPath) Document containing the
+#                                  table.
+#      path                      - (string) XPath string identifying elements
+#                                  in which to search for links.
+#                                  element(s) for the table.  If there
+#                                  are multiple such elements, each is
+#                                  searched and first matching element
+#                                  is returned.
+# ------------------------------------------------------------------------
+
+sub getHrefs($$) {
+    my ($xpath, $path) = @_;
+    my @result = ();
+    foreach my $context ($xpath->findnodes($path)->get_nodelist) {
+        foreach my $href ($xpath->findnodes(".//a", $context)->get_nodelist) {
+            my $url = $href->getAttribute("href");
+            if ($url eq "") {
+                # An "onclick" handler may be used instead of an "href".
+
+                $url = $href->getAttribute("onclick");
+                if ($url eq "") {
+                    next;
+                } else {
+                    my $index = index($url, "window.location.href = ");
+                    if ($index >= 0) {
+                        $url = substr($url, $index + 24, -2);
+                    }
+                }
+            }
+            push(@result, $url);
+        }
+    }
+    return @result;
+}
+
+# ------------------------------------------------------------------------
+# numTableRows
+#
+#      This subroutine turns a count of the number of rows in a table.
+#
+# Results:
+#      The return value is the number of rows in the table given by
+#      $xpath.  If the table doesn't exist, or contains no rows, then
+#      0 is returned.
+#
+# Arguments:
+#      xpath                     - (XML::XPath) Document containing the
+#                                  table.
+#      tablePath                 - (string) XPath string identifying the
+#                                  <table> element for the table.  If there
+#                                  are multiple such elements, the first
+#                                  is used.
+# ------------------------------------------------------------------------
+
+sub numTableRows($$) {
+    my ($xpath, $tablePath) = @_;
+
+    my $tables = $xpath->findnodes($tablePath);
+    if (!$tables->isa("XML::XPath::NodeSet") || ($tables->size() == 0)) {
+        return 0;
+    }
+
+    # Iterator over all of the rows of the table.
+
+    my $table = $tables->get_node(1);
+    return $xpath->findnodes(".//tr", $table)->size();
+}
+
+# ------------------------------------------------------------------------
+# getAttributes
+#
+#      Extract a given attribute from a set of elements.
+#
+# Results:
+#      The return value is a list containing the values of any
+#      attributes matching $attribute found in elements identified
+#      by $path.
+#
+# Arguments:
+#      xpath                     - (XML::XPath) Document containing the
+#                                  table.
+#      path                      - (string) XPath string identifying elements
+#                                  in which to search for the attribute.
+#      attribute                 - (string) Name of the desired attribute.
+# ------------------------------------------------------------------------
+
+sub getAttributes($$$) {
+    my ($xpath, $path, $attribute) = @_;
+    my @result = ();
+    foreach my $element ($xpath->findnodes($path)->get_nodelist) {
+        my $att = $element->getAttribute($attribute);
+        if ($att) {
+            push(@result, $att);
+        }
+    }
+    return @result;
+}
+
+# ------------------------------------------------------------------------
+# getSubtrees
+#
+#      Given an XPath, return XML for all of the matching nodes.
+#
+# Results:
+#      The return value is a string containing the XML text of each
+#      node that matches $path, with separators between matching nodes.
+#
+# Arguments:
+#      xpath                     - (XML::XPath) Document containing the
+#                                  table.
+#      path                      - (string) XPath string identifying elements
+#                                  in which to search for the attribute.
+# ------------------------------------------------------------------------
+
+sub getSubtrees($$) {
+    my ($xpath, $path) = @_;
+    my $result = '';
+    my $separator = '';
+    foreach my $element ($xpath->findnodes($path)->get_nodelist) {
+        $result .= $separator . $element->toString();
+        $separator = "\n-------------------------\n";
+    }
+    return $result;
+}
+
+# ------------------------------------------------------------------------
+# getGlobalNavElement
+#
+#      This subroutine returns an element from the global navigation,
+#      based on text that is displayed for the element.
+#
+# Results:
+#      The return value is the XML::XPath::Node for the selected element,
+#      or undef if there is no such element.
+#
+# Arguments:
+#      xpath                     - (XML::XPath) Document containing the
+#                                  table.
+#      pattern                   - (string) Regular expression to match
+#                                  against the text of each global
+#                                  navigation element.
+# ------------------------------------------------------------------------
+
+sub getGlobalNavElement {
+    my ($xpath, $pattern) = @_;
+
+    my $elements = $xpath->findnodes('//a[@class="frame_globalNavOption"]');
+    if ($elements->size() == 0) {
+        return undef;
+    }
+
+    # Iterate over all of the navigation elements and pick the first
+    # whose text matches the pattern.
+
+    foreach my $element ($elements->get_nodelist) {
+        if ($element->string_value() =~ m/$pattern/s) {
+            return $element;
+        }
+    }
+    return undef;
+}
+
+# ------------------------------------------------------------------------
+# stripSpace
+#
+#      Remove whitespace from the beginning and end of a string, and
+#      return the result.
+#
+# Arguments:
+#      s                         - (string) String to strip.
+# ------------------------------------------------------------------------
+
+sub stripSpace($) {
+    my ($s) = @_;
+    $s =~ s|^\s*(.*[^\s])\s*|$1|s;
+    return $s;
+}
+
+# ------------------------------------------------------------------------
+# isWindows
+#
+#      Returns true if we're running on Windows.
+# ------------------------------------------------------------------------
+
+sub isWindows {
+    return ($^O eq "MSWin32");
+}
+
+# ------------------------------------------------------------------------
+# isLinux
+#
+#      Returns true if we're running on Linux.
+# ------------------------------------------------------------------------
+
+sub isLinux() {
+    return ($^O eq "linux");
+}
+
+# ------------------------------------------------------------------------
+# isLinuxUTF8()
+#
+#      Returns true if we're running on Linux.
+# ------------------------------------------------------------------------
+
+sub isLinuxUTF8() {
+    return (isLinux() && $ENV{'LANG'} eq 'en_US.UTF-8');
+}
+
+# ------------------------------------------------------------------------
+# isWindows2008
+#
+#      Returns true if we're running on Windows 2008 or Vista.
+# ------------------------------------------------------------------------
+
+sub isWindows2008() {
+    if (isWindows()) {
+        my @ver = Win32::GetOSVersion();
+        my $majorVer = $ver[1];
+        if ($majorVer == 6) {
+            return 1;
+        }
+    }
+
+    # Not win2k8.
+    return 0;
+}
+
+#-------------------------------------------------------------------------
+# createFakeServerReponsesFromFile
+#      Load a file containing responses from a previous run of ECSCM drivers
+#      and generate a list suitable for use by the "fakeServer" function that
+#      will provide responses for the test run
+#
+#      It has some special handling to look at log data the ECSCM drivers
+#      creates for running shell commands (like calling p4) and maps those
+#      into responses to a "LogMessage" command
+#
+#      To create the log files:
+#          load the ECSCM driver and run with $opts->{logging}=1
+#          copy the log files (from the workspace to the test/samples directory
+#
+# Results:
+#      The return value is a list of responses in the form
+#      that is used by "fakeServer".
+#      An empty list indicates an error
+#
+# Side Effects:
+#      None
+#
+# Arguments:
+#      ecscm_ResponseFile   -   This is a file captured from a live run of
+#                               ECSCM drivers with logging turned on
+# Notes:
+#      This function is specific to ECSCM drivers and the log
+#      format that it creates, but it could be easily adapted to
+#      work with anything that logs the requests and responses
+#      to the Commander server.
+#
+#-------------------------------------------------------------------------
+sub createFakeServerReponsesFromFile ($) {
+    my @responses;
+    my $ecscm_ResponseFile = shift;
+    my $inputLine;
+    my $isServerResponseBlock;
+    my $serverResponseBlock;
+    my $isCommandResponseBlock;
+    my $commandResponseBlock;
+    my $serverAPI;
+    my $foundGetVersions = 0;
+    my $foundGetPlugin = 0;
+
+
+    open (ECSCMRESP, "< $ecscm_ResponseFile") || die "Could not open response file $ecscm_ResponseFile";
+    while ($inputLine = <ECSCMRESP>) {
+
+        # For Linux, remove the Carriage Return if it is in the file
+
+        $inputLine =~ s/\r//;
+
+        # Process a server response
+        if ($isServerResponseBlock) {
+
+            # Add the current line to the response block
+            $serverResponseBlock = $serverResponseBlock . $inputLine;
+
+            # Process the last line of a server response
+            if ($inputLine =~ /<.responses>/) {
+                push (@responses, $serverAPI, $serverResponseBlock);
+                #####print "1 - Adding $serverAPI\n";   #  $serverResponseBlock);
+                $isServerResponseBlock = 0;
+                next;
+            }
+        }
+
+        # Process a command block
+        elsif ($isCommandResponseBlock) {
+            if ($inputLine =~ /^           : (.*)$/) {
+                $commandResponseBlock = $commandResponseBlock . "\n$1";
+            }
+            else
+            {
+                # We are past the end of the block
+
+                #  This block uses a trick.  It simulates the running of a shell command.
+                #  ElectricSentry has some test code that will change a shell invocation
+                #  to a server request using "logMessage".  That code knows how to read
+                #  this response, which is not legal server data, and handle it as the
+                #  output from running a shell command.
+                #  See the function SimulateRunCommand in ElectricSentry.pl
+                #  Use xml_quote to remove XML reserved chars from the commandResponseBlock
+
+                $serverResponseBlock = makeServerResponse(
+                    outdent(q{
+                    |      <simulatedRunCommand>
+                             <commandOutput>}) . xml_quote($commandResponseBlock) . "</commandOutput>\n" .
+                    outdent(q{
+                    |      </simulatedRunCommand>}) );
+                push (@responses, $serverAPI, $serverResponseBlock);
+                #####print "2 - Adding $serverAPI\n";   #  $serverResponseBlock);
+                $isCommandResponseBlock = 0;
+            }
+        }
+
+
+        if (!$isServerResponseBlock  &&  !$isCommandResponseBlock) {
+
+            # look for the start of a server response block
+            #     <responses version="2.0">
+
+            if ($inputLine =~ /<responses/) {
+                $serverResponseBlock = $::RESPONSE_PROLOG;
+                $isServerResponseBlock = 1;
+            }
+
+            # look for the start of a command response block
+
+            if ($inputLine =~ /^ Log Result: (.*)$/) {
+                $serverAPI = "logMessage";
+                $commandResponseBlock = $1;
+                $isCommandResponseBlock = 1;
+            }
+
+            # Save the name of the requested Commander Server API
+            #      Request to Commander: getProperty
+
+            if ($inputLine =~ /^Request to Commander: (.*)$/) {
+                $serverAPI = $1;
+                if ($serverAPI eq "getVersions") {
+                    $foundGetVersions = 1;
+                }
+                if ($serverAPI eq "getPlugin") {
+                    $foundGetPlugin = 1;
+                }
+            }
+        }
+    }
+
+    # process the last (unterminated) Command Response Block
+    if ($isCommandResponseBlock) {
+
+        $serverResponseBlock = makeServerResponse(
+            outdent(q{
+            |      <simulatedRunCommand>
+                     <commandOutput>}) . xml_quote($commandResponseBlock) . "</commandOutput>\n" .
+            outdent(q{
+            |      </simulatedRunCommand>}) );
+        push (@responses, $serverAPI, $serverResponseBlock);
+        $isCommandResponseBlock = 0;
+    }
+
+    #  For compatibility of old "log" files with a new call that is being
+    #  made, add a fakeServer response to "getVersions" if there was not one in
+    #  the data
+    if (! $foundGetVersions) {
+
+        $serverAPI = "getVersions";
+        $serverResponseBlock = makeServerResponse(
+            outdent(q{
+               |<serverVersion>
+                  <label>build_2.2_14508_OPT_2008.04.25_02:04:02</label>
+                  <protocolVersion>2.0</protocolVersion>
+                  <schemaVersion>23</schemaVersion>
+                  <version>2.2.1.14508</version>
+                </serverVersion>}
+            )
+        );
+
+        push (@responses, $serverAPI, $serverResponseBlock);
+        ####print "Adding $serverAPI\n";   #  $serverResponseBlock);
+    }
+
+    # Add a default response for getPlugin if it was not in the data
+    #   As of now, this call is not recorded in the log
+    if (! $foundGetPlugin) {
+
+        $serverAPI = "getPlugin";
+        $serverResponseBlock = makeServerResponse(
+            outdent(q{
+               |<plugin>
+                  <pluginId>23</pluginId>
+                  <pluginName>ECSCM-1.0</pluginName>
+                  <author>Electric Cloud</author>
+                  <createTime>2010-03-15T02:46:28.678Z</createTime>
+                  <description>Base plugin for all SCM plugins</description>
+                  <label>ECSCM</label>
+                  <lastModifiedBy>admin</lastModifiedBy>
+                  <modifyTime>2010-03-15T02:46:31.756Z</modifyTime>
+                  <owner>admin</owner>
+                  <pluginKey>ECSCM</pluginKey>
+                  <pluginVersion>1.0</pluginVersion>
+                  <promoted>1</promoted>
+                  <projectName>ECSCM-1.0</projectName>
+                  <propertySheetId>932</propertySheetId>
+                </plugin>
+            })
+        );
+
+        push (@responses, $serverAPI, $serverResponseBlock);
+        ####print "Adding $serverAPI\n";   #  $serverResponseBlock);
+    }
+
+
+    close (ECSCMRESP);
+    return @responses;
+}
+
+
+#-------------------------------------------------------------------------
+# runECSCMCommand
+#
+#      Execute an ECSCM command and collect its standard output and standard
+#      error separately.
+#
+# Results:
+#      The return value is a list with three elements:
+#           standard output from the command
+#           standard error
+#           exit status
+#
+# Side Effects:
+#      None, except for whatever the command does.
+#
+# Arguments:
+#      command -          Command to invoke.
+#-------------------------------------------------------------------------
+
+sub runECSCMCommand($) {
+    my ($command) = @_;
+    my $out = `$command 2>_err`;
+    my $err = readFile("_err");
+    unlink("_err");
+    return ($out, $err, ($? >>8) );
+}
+
+
+#-------------------------------------------------------------------------
+# executeECSCMTest
+#
+#      Does some standard operations that are needed to run an ECSCM test
+#      such as setting up the fake server, running the command, debug
+#      loggging, checking for some standard errors, etc.
+#
+# Results:
+#      The return value is a list with three elements:
+#           standard output from the command
+#           standard error
+#           exit status
+#
+# Side Effects:
+#      Calls fakeServer, which sets a value for $::gServerLog
+#      Adds logging information to DEBUGOUT
+#
+# Arguments:
+#      ECSCMPreamble        -   String containing Perl code to execute
+#      responseFileName     -   File containing the desired serverResponses
+#                               (name only - this fn supplies the path)
+#      ignoreErrors         -   Boolean - set to disable some standard error checks
+#-------------------------------------------------------------------------
+
+sub executeECSCMTest($$$) {
+    my $ECSCMPreamble = shift;
+    my $responseFileName = shift;
+    my $ignoreErrors = shift;
+
+    #  Create the responses by extracting them from a previous log file
+    #  and pass it to the fake server
+    #  (This includes fake responses for calls to shell commands like "p4")
+
+    my @responses = createFakeServerReponsesFromFile ("$::gTestFileDir/$responseFileName");
+    fakeServer (@responses);
+
+    # Set dummy COMMANDER_ env variables to run from a step
+    #  (where they would already be set)
+
+    $ENV{COMMANDER_PORT}  =  $::gAuxPort;
+    $ENV{COMMANDER_SERVER}  =  $::gTarget;
+
+    $ENV{COMMANDER_JOBID}  =  "961";
+    $ENV{COMMANDER_JOBSTEPID}  =  "5535";
+    $ENV{COMMANDER_SESSIONID}  =  "M7J8WJ187J1SG7CX";
+    $ENV{COMMANDER_WORKSPACE}  =  "//EAD620/ECWork/job_961";
+    $ENV{COMMANDER_WORKSPACE_UNIX}  =  "/job_961";
+    $ENV{COMMANDER_WORKSPACE_WINDRIVE}  =  "N:/job_961";
+    $ENV{COMMANDER_WORKSPACE_WINUNC}  =  "//EAD620/ECWork/job_961";
+
+    # Set ElectricCommander to insecure mode, since fake server doesn't
+    # support https.
+
+    $ENV{COMMANDER_SECURE} = 0;
+
+    # Store the Perl code in a file
+
+    my $perlCodeFile = "$::gTestOut/perlcode.pl";
+    open (PERLCODE, "> $perlCodeFile") or die;
+    print (PERLCODE $ECSCMPreamble);
+    close (PERLCODE);
+
+    # Call the Sentry operation
+
+    my $cmd = qq{"$^X" "$perlCodeFile"};
+    my ($out, $err, $status) = runECSCMCommand($cmd);
+
+    # Check for common errors
+
+    assertEq(0, $status, "exit code") unless $ignoreErrors;
+    assertEq("", $err, "standard error") unless $ignoreErrors;
+
+    # Stop the server
+
+    serverDown();
+
+    #  Create some debug output - this is useful when creating new tests
+
+    print DEBUGOUT "STDOUT\n$out\n" unless ($out eq "");
+    print DEBUGOUT "STDERR\n$err\n" unless ($err eq "");
+    print DEBUGOUT "SERVER LOG\n" . $::gServerLog->findnodes_as_string("/") . "\n" unless ($::gServerLog eq "");
+
+    return ($out, $err, $status);
+}
+
+#-------------------------------------------------------------------------
+# filterMulitlineString
+#
+#      Extract lines from a multi-line string based on a matching pattern.
+#
+# Results:
+#      The return value is a new string containing only the matching lines
+#
+# Side Effects:
+#      None
+#
+# Arguments:
+#       multiLineString     -   incoming string containing one or more
+#                               lines separated by new lines
+#       matchPattern        -   pattern to match each line.  It is the
+#                               "text portion" of a regular expression.
+#                               Do not include delimiters or modifiers,
+#                               although "embedded modifiers" in the
+#                               text portion should be fine.
+#
+#-------------------------------------------------------------------------
+sub filterMulitlineString($$) {
+
+    my $multiLineString = shift;
+    my $matchPattern = shift;
+    my $filteredString = "";
+
+    # Iterate over lines in the incoming string
+
+    my @lines = split /\n/, $multiLineString;
+    foreach (@lines) {
+
+        # Add matching lines to the result string
+        /$matchPattern/ and do {$filteredString = $filteredString . $_ . "\n";};
+        # /$matchPattern/ and do {$filteredString = $filteredString . $_;};
+    }
+
+    # Return the filtered string
+
+    return ($filteredString);
+}
+
+
+
+# ------------------------------------------------------------------------
+# makeServerResponse
+#
+#      Wrap supplied contents to make a complete response document.
+#
+# Arguments
+#      contents        - XML body of the server response.
+# ------------------------------------------------------------------------
+
+sub makeServerResponse($) {
+    my ($contents) = shift;
+    if ($contents ne "") {
+        return ($::RESPONSE_PROLOG . "    <response requestId=\"1\">\n"
+                . $contents
+                . "\n    </response>\n</responses>");
+    } else {
+        return ($::RESPONSE_PROLOG . "    <response requestId=\"1\"/>"
+                . "\n</responses>");
+    }
+
+}
+
+# ------------------------------------------------------------------------
+# httpServerUp
+#
+#    Starts an HTTP server to serve files.  The url to use to contact the
+#    server is stored in $::gHttpUrl.
+# ------------------------------------------------------------------------
+
+sub httpServerUp {
+    if ( $::gHttpServerRunning ) {
+        return ($::gHttpUrl);
+    }
+    my $origDir = cwd();
+
+    mesg('DBG', "--httpServerUp: origDir=$origDir\n");
+    # Make the path absolute, if it isn't already
+    my $testout = Cwd::abs_path($::gTestOut);
+
+    mesg('DBG', "--httpServerUp: testout=$testout\n");
+    chdir($testout)
+        || die("Couldn't cd to $testout from $origDir");
+
+    mesg('DBG', "--httpServerUp: Starting httpServer.pl\n");
+    $::gHttpServerPid = open(HTTPSERVER, "-|",
+                             "\"$^X\" \"$::gNTestDir/httpServer.pl\" " .
+                             "--log=http-srv.log ");
+
+    # Wait (up to) a minute until the 'url' is printed on stdout
+
+    my $rin = '';
+    vec($rin,fileno(HTTPSERVER),1) = 1;
+    if (!select($rin, undef, undef, 60)) {
+        die "ntest error: no response from http-srv after 60s\n";
+    }
+    # cd back into the original directory
+
+    chdir($origDir);
+
+    $::gHttpUrl = <HTTPSERVER>;
+    $::gHttpUrl =~ s/\s*URL:(.*)\n?/$1/;
+
+    # Add signal handler to shut down on exit
+
+    $SIG{INT}     = \&signalHandler;
+    $SIG{QUIT}    = \&signalHandler;
+    $SIG{KILL}    = \&signalHandler;
+
+    # Server is up and running.
+
+    $::gHttpServerRunning = 1;
+
+    mesg('DBG', "httpServerUp : pid=$::gHttpServerPid : url=$::gHttpUrl\n");
+
+    return ($::gHttpUrl);
+}
+
+#-------------------------------------------------------------------------
+# httpServerDown
+#
+#       Shutdown the HTTP server.
+#-------------------------------------------------------------------------
+
+sub httpServerDown() {
+    # Shutdown the http server nicely.
+    if (defined($::gHttpServerPid) && $::gHttpServerPid != 0) {
+        my $link = "quit";
+        mesg('DBG', "shutting down HTTP server ");
+
+        my $url     = $::gHttpUrl . "quit";
+        my $request = HTTP::Request->new('GET', $url);
+
+        mesg('DBG', "sending /quit message to $::gHttpUrl\n");
+        my $response = $::gUserAgent->request($request);
+
+        # Wait for the server to exit. (close will wait on pid)
+        mesg('DBG', "waiting for HTTP server pid=$::gHttpServerPid to exit\n");
+        eval {
+            close HTTPSERVER;
+        };
+
+        # Reset gServerPid so runtests knows it doesn't have to shut it down.
+        $::gHttpServerPid = 0;
+
+        mesg('DBG', "HTTP server down\n");
+    }
+}
+
+# ------------------------------------------------------------------------
+# smtpServerUp
+#
+#    Starts an SMTP server to check the delivery of Notification emails.
+#
+# Results:
+#    None.
+#
+# Arguments:
+#    mode              - mode to run the ntest-aux in 'server'
+#    responses         - list of 'request', 'response' pairs.
+#
+# Side Effects:
+#    None
+# ------------------------------------------------------------------------
+
+sub smtpServerUp($@) {
+
+    if ( $::gSmtpServerRunning ) {
+        return ($::gSmtpPort);
+    }
+    my $testName = shift;
+
+    my $upfile = 'smtp-srv.up';
+
+    # Remember the current working directory
+
+    my $origDir = cwd();
+
+    mesg('DBG', "--smtpServerUp: origDir=$origDir\n");
+
+    # Make the path absolute, if it isn't already
+    my $testout = $::gTestOut =~ /^(\/|[a-zA-Z]:)/
+        ? $::gTestOut
+        : $ENV{"COMMANDER_HOME"} . "/$::gTestOut";
+
+    mesg('DBG', "--smtpServerUp: testout=$testout\n");
+    chdir($testout)
+        || die("Couldn't cd to $testout from $origDir");
+
+    # Clear the up file from last time.
+
+    #my $upfile = "$testout/smtp-srv.log";
+    #unlink $upfile;
+
+    # Open a pipe to the server process to read from it.
+
+    unlink $upfile;
+
+    mesg('DBG', "--smtpServerUp: Starting smtpServer.pl\n");
+    $::gSmtpServerPid = open(SERVER, "-|",
+                             "perl \"$::gNTestDir/smtpServer.pl\" " .
+                             "--log=smtp-srv.log " .
+                             "--upfile=$upfile " .
+                             "--recordfile=smtp-record.log " .
+                             "--test=$testName ");
+
+    # Wait (up to) a minute until the 'exists' file is created.
+
+    my $rin = '';
+    vec($rin,fileno(SERVER),1) = 1;
+    if (!select($rin, undef, undef, 60)) {
+        die "ntest error: no response from smtp-srv after 60s\n";
+    }
+
+    # cd back into the original directory
+
+    chdir($origDir);
+
+    $::gSmtpPort = <SERVER>;
+    $::gSmtpPort =~ s/\s*listening on port (\d+)\n?/$1/;
+
+    # Add signal handler to shut down on exit
+
+    $SIG{INT}     = \&signalHandler;
+    $SIG{QUIT}    = \&signalHandler;
+    $SIG{KILL}    = \&signalHandler;
+
+    # Server is up and running.
+
+    $::gSmtpServerRunning = 1;
+
+    mesg('DBG', "smtpServerUp : pid=$::gSmtpServerPid : port=$::gSmtpPort\n");
+
+    my $smtpPort = $::gSmtpPort ;
+    return ($smtpPort) ;
+}
+
+# ------------------------------------------------------------------------
+# smtpServerDown;
+#
+#       Shuts down the SMTP server and exits.  Used as a signal handler while
+#       the SMTP server is up so we don't leave the process hanging.
+#
+# Arguments:
+#       None
+#
+# Side Effects:
+#       Exits
+# ------------------------------------------------------------------------
+sub smtpServerDown ($) {
+
+    my ($testId) = @_;
+
+    # Shutdown the smtp server nicely.
+    if (defined($::gSmtpServerPid) && $::gSmtpServerPid != 0) {
+        my $link = "quit";
+
+        mesg('DBG', "shutting down SMTP server ");
+
+        sendStopEmail( $testId);
+
+        # Wait for the server to exit. (close will wait on pid)
+        mesg('DBG', "waiting for SMTP server pid=$::gSmtpServerPid to exit\n");
+        eval {
+            close SERVER;
+        };
+
+        # Reset gServerPid so runtests knows it doesn't have to shut it down.
+        $::gSmtpServerPid = 0;
+
+        mesg('DBG', "SMTP server down\n");
+    }
+}
+
+# ------------------------------------------------------------------------
+# sendStopEmail;
+#
+#       Sends a special email to the SMTP server requesting it to shutdown.
+#
+# Arguments:
+#       message    A text message - usually specifying the name of the modtest
+#
+# Side Effects:
+#       Exits
+# ------------------------------------------------------------------------
+sub sendStopEmail($) {
+
+    my ($message) = @_;
+
+    mesg('DBG', "sendStopEmail: starting: $message \n");
+
+    my $sender = new Mail::Sender {
+                smtp => 'localhost',
+                auth => 'LOGIN',
+                authid => 'gooduser',
+                authpwd => 'goodpass',
+                from => 'controller-stop@electric-cloud.com',
+                port => $::gSmtpPort,
+                on_errors => undef,
+        }
+        or die "sendStopEmail: can't create the Mail::Sender object: $Mail::Sender::Error\n";
+
+    mesg('DBG', "sendStopEmail: created Mail::Sender object \n");
+
+    $sender->Open({
+                to => 'qa@electric-cloud.com',
+                subject => 'Request to STOP for SMTP server'
+        })
+        or die "sendStopEmail: can't open the message: $sender->{'error_msg'}\n";
+
+    mesg('DBG', "sendStopEmail: open connection to SMTP server \n");
+
+    $sender->SendLineEnc( $message . "\n");
+
+    $sender->Close()
+        or die "sendStopEmail: failed to send the message: $sender->{'error_msg'}\n";
+
+    mesg('DBG', "sendStopEmail: sent email request to stop SMTP server: $message \n");
+}
+
+# ------------------------------------------------------------------------
+# sendResetEmail;
+#
+#       Sends a special email to the SMTP server requesting it reset (clear)
+#       the recorded email messages.
+#
+# Arguments:
+#       message    A text message - usually specifying the name of the modtest
+#
+# Side Effects:
+#       Exits
+# ------------------------------------------------------------------------
+sub sendResetEmail($) {
+
+    my ($message) = @_;
+
+    mesg('DBG', "sendResetEmail: starting \n");
+
+    my $sender = new Mail::Sender {
+                smtp => 'localhost',
+                auth => 'LOGIN',
+                authid => 'gooduser',
+                authpwd => 'goodpass',
+                from => 'controller-reset@electric-cloud.com',
+                port => $::gSmtpPort,
+                on_errors => undef,
+        }
+        or die "sendResetEmail: can't create the Mail::Sender object: $Mail::Sender::Error\n";
+
+    mesg('DBG', "sendResetEmail: created Mail::Sender object \n");
+
+    $sender->Open({
+                to => 'qa@electric-cloud.com',
+                subject => 'Request to RESET for SMTP server'
+        })
+        or die "sendResetEmail: can't open the message: $sender->{'error_msg'}\n";
+
+    mesg('DBG', "sendResetEmail: open connection to SMTP server \n");
+
+    $sender->SendLineEnc( "ModTestName===" . $message . "===\n");
+
+    $sender->Close()
+        or die "sendResetEmail: failed to send the message: $sender->{'error_msg'}\n";
+
+    mesg('DBG', "sendResetEmail: sent email request to reset recording of SMTP server \n");
+}
+
+sub createPluginJar {
+    my $jar = shift;
+    my $config = shift;
+    my $project = shift;
+    my %extraFiles = @_;
+    my $zip = Archive::Zip->new();
+
+    File::Path::mkpath(dirname($jar));
+
+    $zip->addDirectory('META-INF/');
+    $zip->addString(
+        qq(<?xml version="1.0" encoding="UTF-8"?>\n) . $config,
+        'META-INF/plugin.xml'
+    );
+    if ($project) {
+        $zip->addString(
+            qq(<?xml version="1.0" encoding="UTF-8"?>\n) . $project,
+            'META-INF/project.xml'
+        );
+    }
+    foreach (keys %extraFiles) {
+        $zip->addString($extraFiles{$_}, $_);
+    }
+    assertEq(AZ_OK, $zip->writeToFileNamed($jar), "created jar file");
+}
+
+# ------------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------------
+
+sub main {
+    mesg('DBG', "ntest started : %s\n", scalar(localtime()));
+
+    # Parse command line arguments into global variables.
+
+    GetOptions(%gOptions);
+    if ($::gHelp) {
+        print $::gHelpMessage;
+        exit(0);
+    }
+
+    # Pick a directory in which to create test-specific subdirectories.
+
+    if (!$::gTestOut) {
+        # No directory specified on the commandline.  If there is an
+        # OUTTOP environment variable, use it to compute a location.
+
+        if ($ENV{OUTTOP}) {
+            $::gTestOut = "$ENV{OUTTOP}/ntest";
+        } else {
+            # Default: assume we are in the test directory for one of the
+            # system modules such as "web" or "agent"; pick a directory
+            # parallel to our grandparent.
+
+            $::gTestOut = "../../../ntest"
+        }
+    }
+    if (!-d $::gTestOut) {
+        File::Path::mkpath($::gTestOut) or die "ntest error:  couldn't "
+                . "create test working directory \"$::gTestOut\": $!";
+    }
+
+    # Initialize a handle to the ElectricCommander.pm object.
+
+    if ($::gFoundECModule) {
+        ElectricCommander::setAbortDefault(0);
+        $::gCommander = new ElectricCommander({
+            server => $::gTarget,
+            debug => $::gDebug,
+            logFile => $::gDebugFile,
+        });
+    }
+
+    # If no Web document root is specified, assume that we are in one
+    # of a few standard development directories and check for a docroot
+    # in one of a few relative directories.
+
+    if (!$::gDocRoot) {
+        my @docrootPath = ("../../../docroot", "docroot", ".");
+        foreach my $dir (@docrootPath) {
+            if (-e "$dir/login.php") {
+                $::gDocRoot = $dir;
+                last;
+            }
+        }
+        if (!$::gDocRoot) {
+            $::gDocRoot = "../docroot";
+        }
+    }
+    $::gDocRoot = File::Spec->rel2abs($::gDocRoot);
+
+    # Initialize various platform-specific configuration variables.
+
+    if (isWindows()) {
+        $::gToolsDir = "C:/cygwin/usr/local/tools";
+        $::gTempDir = "$ENV{WINDIR}/Temp";
+        $::gTempDir =~ s|\\|/|g;
+    } else {
+        $::gToolsDir = "/usr/local/tools";
+        $::gTempDir = "/tmp";
+    }
+    mesg('DBG', "Temp directory: " . $::gTempDir . "\n");
+
+    # Parse the gConstraints - it's comma-separated.  Look in the environment
+    # if the command line argument isn't present.
+
+    if ($::gConstraintArg eq '' && defined($ENV{NTEST_CONSTRAINTS})) {
+        $::gConstraintArg = $ENV{NTEST_CONSTRAINTS};
+    }
+
+    initConstraints();
+
+    # Iterate over test files & directories.
+
+    my @files;
+
+    foreach my $arg (@ARGV) {
+        if (-d $arg) {
+            # This argument names a directory.  Process all of the
+            # .ntest files in it.
+
+            push(@files, glob("$arg/*.ntest"));
+        } else {
+            # This argument must name a single file.
+
+            push(@files, $arg);
+        }
+    }
+    if (!@files) {
+        @files = glob("*.ntest");
+    }
+
+    foreach my $testFile (@files) {
+        my $date;
+        if ($::gQuiet) {
+            $date = "";
+        } else {
+            $date = `date`;
+            $date =~ s/\s+$//;
+            $date .= ": ";
+        }
+
+        mesg('TEST', ($::gQuiet ? '' : "\n") . "$date$testFile:\n");
+
+        $::gTestFileDir = getcwd();
+        $::gTestFileDir .= "/" . dirname($testFile) unless dirname($testFile) eq ".";
+        $::gTestFile    = $testFile;
+
+        my @oldinc = @INC;
+        push @INC, $::gTestFileDir;
+
+        if (!(do $testFile)) {
+            my $message = $@;
+            if (!$message) {
+                # If the test file isn't found no message is left in $@,
+                # but there is a message in $!.
+
+                $message = $!;
+            }
+            mesg('ERR', "ntest error: error processing %s: %s\n",
+                 $testFile, $message);
+        }
+        @INC = @oldinc;
+    }
+
+    # Print timing information
+
+    my $testDuration = 0;
+    foreach my $duration (values(%::gTestTimes)) {
+        $testDuration += $duration;
+    }
+    mesg('TEST', "\nTotal test duration: "
+            . duration_exact($testDuration) . "\n");
+
+    my $headerPrinted = 0;
+    foreach my $key (sort {$::gTestTimes{$b} <=> $::gTestTimes{$a};}
+            (keys(%::gTestTimes))) {
+        my $duration = $::gTestTimes{$key};
+        last if $duration <= 5;
+        if (!$headerPrinted) {
+            mesg('TEST', "\nTest durations >= 5 seconds:\n");
+            $headerPrinted = 1;
+        }
+        mesg('TEST', "  $key " . (' ' x (50 - length($key)))
+             . duration_exact($duration) . "\n");
+    }
+
+    # Print summary information.
+
+    my $failedTests = "";
+    if ($::gFailedTests > 0) {
+        $failedTests = "\nFailed Tests:\n   @::gFailedTestCollector";
+    }
+    mesg('TEST', $failedTests . "\nTotal tests: $::gTotalTests   Passed: "
+        . ($::gTotalTests - $::gSkippedTests - $::gFailedTests)
+        . "   Failed: $::gFailedTests   Skipped: $::gSkippedTests\n");
+    mesg('DBG', "\nntest finished: %s\n", scalar(localtime()));
+}
+
+main();
+
+END {
+    # Make sure the fakeagent is gone
+    serverDown();
+    smtpServerDown('end');
+    httpServerDown();
+}
