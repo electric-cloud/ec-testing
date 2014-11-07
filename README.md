@@ -26,18 +26,10 @@ A few examples are provided to get your started with ntest:
 # CONTENT:
 Here is a brief explanation of the files provided:
 
-* Assert.pm
-
-   assert subroutines for use by ntest.
-* ECTest.pm
-
-   Helper routines for running tests against a commander server.
-* ntest
-
-   This file contains the basic infrastructure for ElectricCommander tests. It is invoked from the command line to run tests and also defines various routines used by tests, such as the "ntest" subroutine that defines a test, various "assert" subroutines for error checking in tests, and other utilities such as those for making HTTP requests.
-* examples
-
-   a library of examples to help you understand the framework.
+* Assert.pm: assert subroutines for use by ntest.
+* ECTest.pm: Helper routines for running tests against a commander server.
+* ntest: This file contains the basic infrastructure for ElectricCommander tests. It is invoked from the command line to run tests and also defines various routines used by tests, such as the "ntest" subroutine that defines a test, various "assert" subroutines for error checking in tests, and other utilities such as those for making HTTP requests.
+* examples: a library of examples to help you understand the framework.
 
 ## MAINTAINER:
 
