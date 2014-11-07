@@ -9,6 +9,7 @@ invoke ntest with a list of files/directories containing your tests
 For example:
 
    ./ntest --target=ECSERVER:443 examples
+
    Will run all the *.ntest files in the examples subdirectory
 
 # EXAMPLES:
@@ -16,7 +17,6 @@ A few examples are provided to get your started with ntest:
 
 1. createProject.ntest: a simple example to verofdy a rpoject has been created
 	properly
-	
 2. createSafeProject.ntest: a few tests to validate a factory procedure called 
 	createSaFeProject in the Ntest project. This procedure is a wrapper around 
 	the "createProject" API, verifying first that the name contains only 
@@ -27,17 +27,21 @@ A few examples are provided to get your started with ntest:
 Here is a brief explanation of the files provided:
 
 * Assert.pm
+
    assert subroutines for use by ntest.
 * ECTest.pm
+
    Helper routines for running tests against a commander server.
 * ntest
+
    This file contains the basic infrastructure for ElectricCommander tests. It is invoked from the command line to run tests and also defines various routines used by tests, such as the "ntest" subroutine that defines a test, various "assert" subroutines for error checking in tests, and other utilities such as those for making HTTP requests.
 * examples
+
    a library of examples to help you understand the framework.
 
 ## MAINTAINER:
 
-Laurent Rochette, Electric Cloud Professional Services Engineer lrochette@electric-cloud.com
+Laurent Rochette, Electric Cloud Professional Services Engineer, lrochette@electric-cloud.com
 
 ## DISCLAIMER:
 
