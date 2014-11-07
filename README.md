@@ -7,13 +7,16 @@ help with your CI/CD process around ElectricCommander.
 invoke ntest with a list of files/directories containing your tests
 
 For example:
+
    ./ntest --target=ECSERVER:443 examples
-   		WIll run all the *.ntest files in the examples subdirectory
+   Will run all the *.ntest files in the examples subdirectory
 
 # EXAMPLES:
-A few examples are provided to get your started with ntest
+A few examples are provided to get your started with ntest:
+
 1. createProject.ntest: a simple example to verofdy a rpoject has been created
 	properly
+	
 2. createSafeProject.ntest: a few tests to validate a factory procedure called 
 	createSaFeProject in the Ntest project. This procedure is a wrapper around 
 	the "createProject" API, verifying first that the name contains only 
