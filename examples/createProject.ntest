@@ -1,8 +1,8 @@
 # -*-Perl-*-
 
-# procedure.ntest -
+# createProject.ntest -
 #
-# System tests for createProcedure
+# System tests for createProject
 #
 # Copyright (c) 2014 Electric Cloud, Inc.
 # All rights reserved
@@ -14,16 +14,21 @@ initCommander();
 $::N = $adminSession;
 
 ntest "create project", {}, sub {
-	my $xpath = $::N->createProject("foo456");
+	my $pid=$$;
+	my $name="foo$pid";
+	my $xpath = $::N->createProject($name);
 	assertOK($xpath, "run createProject");
 	# make sure it was created properly
     assertDef($xpath, "createProject finished without a timeout");
     if ($xpath) {
-        $projectId  = $xpath->findvalue("//projectId");
-        $projectName = $xpath->findvalue("//projectName");
+        my $projectId  = $xpath->findvalue("//projectId");
+        my $projectName = $xpath->findvalue("//projectName");
 
-        assertTrue($projectId && $projectId ne "",'valid project id');
-        assertEq('foo456',$projectName,"project $projectName created");
+        assertTrue($projectId && $projectId ne "", 'valid project id');
+        assertEq($name, $projectName, "project $projectName created");
 
+        $::N->setProperty("ec_tags", {projectName => $name, value => " ntest "});
+    # CLEAN
+    $::N->deleteProject($name);
     }
 };    

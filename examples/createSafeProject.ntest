@@ -1,0 +1,140 @@
+# -*-Perl-*-
+
+# createSafeProject.ntest -
+#
+# System tests for createSafeProject
+# The example factory procedure si provide in Ntest.xml
+# It a siple factory procedure that create a new project and enforcing 2 
+# naming conventions:
+#  - only alphanumeric and underscore characters (exit 2)
+#  - can not start by a number (exit 1)
+#
+# Copyright (c) 2014 Electric Cloud, Inc.
+# All rights reserved
+
+use strict;
+use ElectricCommander;
+use ECTest;
+
+initCommander();
+$::N = $adminSession;
+
+#
+# Global Variables
+my $PROJ="Ntest";           # Name of the project to test
+my $PROC="createSafeProject"; # Name of the procedure to test
+
+my $pid=$$;                 # process id to generate semi random names
+my $goodName="foo$pid";     # good project name
+my $badName=$pid."foo";     # bad project name
+my $spaceName ="foo $pid";  # bad name with space
+
+ntest "Check project \"$PROJ\" exists", {}, sub {
+    my $xpath = $::N->getProject($PROJ);
+    if ($xpath) {
+        my $projectName = $xpath->findvalue("//projectName");
+        assertEq($PROJ,$projectName,"project $projectName exists");
+    } else {
+        fail("Project $PROJ does not exist on the server");
+    }
+};
+
+
+ntest "Check procedure \"$PROC\" exists", {}, sub {
+    my $xpath = $::N->getProcedure($PROJ, $PROC);
+    if ($xpath) {
+        my $procedureName = $xpath->findvalue("//procedureName");
+        assertEq($PROC,$procedureName,"procedure $procedureName exists");
+    } else {
+        fail("Procedure $PROC does not exist on the server");
+    }
+};
+
+
+ntest "$PROC: project with correct name", {}, sub {
+	my $xpath = $::N->runProcedure("$PROJ", {
+        procedureName=>"$PROC",
+        actualParameter=>[{actualParameterName=>"nameOfTheProject",
+                           value=>$goodName}]
+      });
+	assertOK($xpath, "run $PROC procedure");
+
+    # make sure it finished
+    assertDef($xpath, "runProcedure finished without a timeout - goodName"); 
+
+    if ($xpath) {
+        # get new job ID
+        my $jobId  = $xpath->findvalue("//jobId");
+        waitForJob($jobId);
+
+        # tag the newly created project to make it easier to find
+        $::N->setProperty("ec_tags", {projectName => $goodName, value => " ntest "});
+
+        # now verify the project exists
+        my $projXML  = $::N->getProject($goodName);
+        my $projectName=$projXML->findvalue("//projectName");
+        assertEq($goodName, $projectName, "project $projectName created");
+
+    # CLEAN
+    $::N->deleteProject($goodName);
+    }
+};    
+
+
+ntest "$PROC: project with name starting with number", {}, sub {
+    my $xpath = $::N->runProcedure("$PROJ", {
+        procedureName=>"$PROC",
+        actualParameter=>[{actualParameterName=>"nameOfTheProject",
+                           value=>$badName}]
+      });
+    assertOK($xpath, "run createSafeProject procedure - badName");
+    # make sure it was created properly
+    # make sure it finished
+    assertDef($xpath, "runProcedure finished without a timeout"); 
+
+    if ($xpath) {
+        # get new job ID
+        my $jobId  = $xpath->findvalue("//jobId");
+        waitForJob($jobId);
+
+        my $jobData = $::N->getJobDetails($jobId);
+        my $outcome = $jobData->findvalue("//job/outcome");
+        my $exitCode = $jobData->findvalue("//job/jobStep[stepName='checkName']/exitCode");
+        
+        # testing outcome=error and exitCode=1
+        assertEq($outcome, "error", "project $badName created despite bad name");
+        assert($exitCode, "==", 1,  "exit code incorrect for project starting with number");
+
+    # CLEAN
+    $::N->deleteProject($badName);
+    }
+};
+
+ntest "$PROC: project with name with space", {}, sub {
+    my $xpath = $::N->runProcedure("$PROJ", {
+        procedureName=>"$PROC",
+        actualParameter=>[{actualParameterName=>"nameOfTheProject",
+                           value=>$spaceName}]
+      });
+    assertOK($xpath, "run createSafeProject procedure - badName");
+    # make sure it was created properly
+    # make sure it finished
+    assertDef($xpath, "runProcedure finished without a timeout"); 
+
+    if ($xpath) {
+        # get new job ID
+        my $jobId  = $xpath->findvalue("//jobId");
+        waitForJob($jobId);
+
+        my $jobData = $::N->getJobDetails($jobId);
+        my $outcome = $jobData->findvalue("//job/outcome");
+        my $exitCode = $jobData->findvalue("//job/jobStep[stepName='checkName']/exitCode");
+        
+        # testing outcome=error and exitCode=1
+        assertEq($outcome, "error", "project $spaceName created despite space in the name");
+        assert($exitCode, "==", 2,  "exit code incorrect for project with a space");
+
+    # CLEAN
+    $::N->deleteProject($spaceName);
+    }
+};

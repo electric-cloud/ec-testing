@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<exportedData xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="commander.xsd" version="61" buildLabel="build_4.2_74531_2014.06.26_10:37:53" buildVersion="4.2.5.74531" passkey="a30cbf89cfdae202c5227ce40fe867512295566d">
+  <exportPath>/projects/Ntest</exportPath>
+  <project>
+    <projectName>Ntest</projectName>
+    <description>A sample project to carry ec-testing examples</description>
+    <resourceName></resourceName>
+    <workspaceName></workspaceName>
+    <propertySheet>
+    </propertySheet>
+    <procedure>
+      <procedureName>createSafeProject</procedureName>
+      <description>A factory procedure to verify that a project is created following some specific naming conventions&#10; - only letter, number and underscore in the name&#10; - does not start by a number</description>
+      <jobNameTemplate></jobNameTemplate>
+      <resourceName></resourceName>
+      <timeLimit></timeLimit>
+      <timeLimitUnits>minutes</timeLimitUnits>
+      <workspaceName></workspaceName>
+      <propertySheet>
+        <property>
+          <propertyName>ec_customEditorData</propertyName>
+          <propertySheet>
+            <property>
+              <propertyName>parameters</propertyName>
+              <propertySheet>
+                <property>
+                  <propertyName>nameOfTheProject</propertyName>
+                  <propertySheet>
+                    <property>
+                      <propertyName>formType</propertyName>
+                      <expandable>1</expandable>
+                      <value>standard</value>
+                    </property>
+                  </propertySheet>
+                </property>
+              </propertySheet>
+            </property>
+          </propertySheet>
+        </property>
+      </propertySheet>
+      <formalParameter>
+        <formalParameterName>nameOfTheProject</formalParameterName>
+        <defaultValue></defaultValue>
+        <description>The name of the project to create</description>
+        <expansionDeferred>0</expansionDeferred>
+        <required>1</required>
+        <type>entry</type>
+      </formalParameter>
+      <step>
+        <stepName>checkName</stepName>
+        <alwaysRun>0</alwaysRun>
+        <broadcast>0</broadcast>
+        <command>#############################################################################&#10;#&#10;# Copyright 2014 Electric-Cloud Inc.&#10;#&#10;#############################################################################&#10;use strict;&#10;$| = 1;&#10;&#10;#############################################################################&#10;#&#10;# parameters&#10;#&#10;#############################################################################&#10;my $projectName="$[nameOfTheProject]";&#10;&#10;# Check the name does not start by a number&#10;if ($projectName =~ /^\d/) {&#10;  printf("The name of the project cannot start by a number: '%s'\n", $projectName);&#10;  exit(1);&#10;}&#10;&#10;# Check the name does contain only letters, numbers and underscore&#10;if ($projectName =~ /\W/) {&#10;  printf("The name of the project can contain only alphanumeric and underscore: '%s'\n", $projectName);&#10;  exit(2);&#10;}</command>
+        <condition></condition>
+        <description>verify the name follows the naming convention</description>
+        <errorHandling>abortJobNow</errorHandling>
+        <exclusiveMode>none</exclusiveMode>
+        <logFileName></logFileName>
+        <parallel>0</parallel>
+        <postProcessor></postProcessor>
+        <precondition></precondition>
+        <releaseMode>none</releaseMode>
+        <resourceName></resourceName>
+        <shell>ec-perl</shell>
+        <timeLimit></timeLimit>
+        <timeLimitUnits>minutes</timeLimitUnits>
+        <workingDirectory></workingDirectory>
+        <workspaceName></workspaceName>
+        <propertySheet>
+        </propertySheet>
+      </step>
+      <step>
+        <stepName>createProject</stepName>
+        <alwaysRun>0</alwaysRun>
+        <broadcast>0</broadcast>
+        <command>#############################################################################&#10;#&#10;# Copyright 2014 Electric-Cloud Inc.&#10;#&#10;#############################################################################&#10;use strict;&#10;use ElectricCommander;&#10;$| = 1;&#10;&#10;# Create a single instance of the Perl access to ElectricCommander&#10;my $ec = new ElectricCommander({'format' =&gt; "json"});&#10;&#10;$ec-&gt;createProject("$[nameOfTheProject]");</command>
+        <condition></condition>
+        <description>now we know the name is safe we can create the project</description>
+        <errorHandling>failProcedure</errorHandling>
+        <exclusiveMode>none</exclusiveMode>
+        <logFileName></logFileName>
+        <parallel>0</parallel>
+        <postProcessor></postProcessor>
+        <precondition></precondition>
+        <releaseMode>none</releaseMode>
+        <resourceName></resourceName>
+        <shell>ec-perl</shell>
+        <timeLimit></timeLimit>
+        <timeLimitUnits>minutes</timeLimitUnits>
+        <workingDirectory></workingDirectory>
+        <workspaceName></workspaceName>
+        <propertySheet>
+        </propertySheet>
+      </step>
+    </procedure>
+  </project>
+</exportedData>
