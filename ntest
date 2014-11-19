@@ -2604,7 +2604,7 @@ sub smtpServerUp($@) {
 
     mesg('DBG', "--smtpServerUp: Starting smtpServer.pl\n");
     $::gSmtpServerPid = open(SERVER, "-|",
-                             "perl \"$::gNTestDir/smtpServer.pl\" " .
+                             "ec-perl \"$::gNTestDir/smtpServer.pl\" " .
                              "--log=smtp-srv.log " .
                              "--upfile=$upfile " .
                              "--recordfile=smtp-record.log " .

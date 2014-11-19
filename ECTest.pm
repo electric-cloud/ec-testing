@@ -98,9 +98,9 @@ sub initCommander()
     #$adminSession->importLicenseData("$licenseData");
 
     # Grant everyone execute permission
-    $adminSession->createAclEntry('group', 'Everyone',
-                                  {systemObjectName => 'server',
-                                   executePrivilege => 'allow'});
+#    $adminSession->createAclEntry('group', 'Everyone',
+#                                  {systemObjectName => 'server',
+#                                   executePrivilege => 'allow'});
 
     # Create the guest user with full rights
 
@@ -141,6 +141,7 @@ sub newSession($$)
         logFile => $::gDebugFile,
     });
     $session->login($user, {password => $password});
+    
     return $session;
 }
 
