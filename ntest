@@ -17,6 +17,7 @@ use strict;
 use warnings;
 use Cwd;
 use File::Basename;
+use Time::Duration;
 use Getopt::Long;
 use Assert;
 
