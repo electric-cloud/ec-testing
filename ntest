@@ -308,6 +308,17 @@ TESTRUN:
         return 1;
     }
 
+    # Check constraints and match pattern to skip this test.
+
+    if ($::gMatch && !($name =~ /$::gMatch/)) {
+        $::gPartialLineOutput = 0;
+        if (!$::gQuiet) {
+            mesg('TEST', "SKIPPED\n");
+        }
+        $::gSkippedTests++;
+        return 1;
+    }
+
     # Log a message on the server
     if ($::gCommander) {
         $::gCommander->logMessage("$::gTestFile:$banner",
@@ -1112,5 +1123,3 @@ sub main {
 }
 
 main();
-
-
