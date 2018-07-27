@@ -506,7 +506,7 @@ sub assertNe($$;$) {
     # test result log.
 
     $::gErrorMessages .= errorMessageHeader("assertNe failed", $desc)
-            . "----- Expected value:
+            . "----- Expected value should be different from:
 $expectedValue
 ----- Value from test was:
 $testValue
