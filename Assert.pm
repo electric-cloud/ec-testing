@@ -60,6 +60,7 @@ use FindBin;
               assertXpath
               errorMessageHeader
               fail
+	      skip
               getElementById
               mesg );
 
@@ -275,6 +276,24 @@ sub fail($) {
     $::gErrorMessages .= errorMessageHeader('test error', $message);
 
     return avoidExcessiveErrors($::gErrorMessages);
+}
+
+# -----------------------------------------------------------------------
+# skip
+#	Invoked by test to skip it (for example for an older version)
+#
+# Results:
+#	A skip message is appended to the global variable $:gSkipMessages
+#	and its new value is returned
+#
+# Arguments:
+#       message    - (string) Description appended to the skip message.
+# -----------------------------------------------------------------------
+sub skip($) {
+   my ($message) = @_;
+
+   $::gSkipMessages .= $message;
+   return $::gSkipMessages;
 }
 
 # ------------------------------------------------------------------------

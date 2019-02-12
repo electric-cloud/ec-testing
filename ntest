@@ -117,6 +117,9 @@ $::gErrorMessages = '';              # During the running of a test, messages
                                      # about test failures collect here.
                                      # Empty means the test has succeeded
                                      # so far.
+$::gSkipMessages = '';               # During the running of a test, messages
+                                     # about skip collect here.
+                                     # Non empty measn the test was skipped.
 $::gTotalTests = 0;                  # Total number of tests executed.
 $::gSkippedTests = 0;                # Total number of tests that were
                                      # skipped because of constraints.
@@ -262,6 +265,7 @@ TESTRUN:
     my $start_time = time();
 
     $::gErrorMessages = '';
+    $::gSkipMessages = '';
     $::gTotalTests++;
     $::gTestName = $name;
 
@@ -387,7 +391,17 @@ TESTRUN:
         $banner = '';
     }
     $::gPartialLineOutput = 0;
-    if ($::gErrorMessages) {
+    if ($::gSkipMessages) {
+        # This test has skip messages; log them. Indent the skip messages
+	# so that it's easy for postprocessor to separate skip messages
+	# from surrounding text.
+  
+	$::gSkippedTests++;
+	my $indentMessage = "\n$::gSkipMessages";
+	$indentMessage =~ s|\n|\n    |g;
+	mesg('TEST', "%s", $banner . "SKIPPED$indentMessage\n");
+    } else {
+      if ($::gErrorMessages) {
         # This test had errors; log them.  Indent the error messages
         # so that it's easy for postprocessors to separate error messages
         # from surrounding text.
@@ -397,7 +411,7 @@ TESTRUN:
         $indentedMessage =~ s|\n|\n    |g;
         mesg('TEST', "%s", $banner . " FAILED$indentedMessage\n");
         push(@::gFailedTestCollector, $name . "\n  ");
-    } else {
+      } else {
         if (!$::gQuiet) {
             mesg('TEST', "%s", $banner . " PASSED\n");
         }
@@ -405,6 +419,7 @@ TESTRUN:
         if ($::gUntilFailure) {
             goto TESTRUN;
         }
+      }
     }
 
     # Collect the duration for this test.
